@@ -51,7 +51,7 @@ enum {
 // north X. Xbox: south A, east B, west X, north Y, as an Xbox pad labels them (cross A, circle B on a PlayStation pad).
 enum { PAD_LAYOUT_NINTENDO, PAD_LAYOUT_XBOX, PAD_LAYOUT_COUNT };
 
-enum { INPUT_BINDING_MAX = 96, INPUT_PAD_BINDING_MAX = 48 };
+enum { INPUT_BINDING_MAX = 96, INPUT_PAD_BINDING_MAX = 48, INPUT_BIND_LINE_MAX = 4096 };
 
 typedef struct { uint8_t key; uint8_t action; } Binding;
 typedef struct { uint8_t pad; uint8_t action; } PadBinding;
@@ -142,6 +142,7 @@ int input_map_set_key(InputMap *m, int action, int slot, int key);
 // get the result in every layout: the layout setting no longer moves them. A change that puts every button of layout
 // back at its default restores the defaults of every layout instead.
 int input_map_set_pad(InputMap *m, int action, int layout, int pad);
+void input_map_swap_ab(InputMap *m, int layout);
 // The bind_ value that gives action its bindings of m: "" when they are the defaults (no line needed), else the entries,
 // with key:default / pad:default for a part at its defaults, or "none".
 void input_map_line(const InputMap *m, int action, char *out, size_t n);

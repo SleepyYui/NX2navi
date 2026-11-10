@@ -22,7 +22,6 @@ typedef enum {
     UI_MENU_AFTER_RESTART,    // note on a setting that is read at start
     UI_MENU_SET_BY_ENV,       // note on a setting an environment variable fixes
     UI_MENU_SAVE_FAILED,
-    UI_MENU_VERSION,          // "NX2navi %s, game %s": the port version and the game update, beside the title
 
     // Screen
     UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC,
@@ -129,7 +128,7 @@ typedef enum {
     UI_BINDS_CANCEL_HINT,     // "Esc cancels, or wait %d s"
     UI_BINDS_TAKEN,           // "%s was taken from %s": the key, the action that lost it
     UI_BINDS_SWAPPED,         // "%s swapped with %s": the two actions
-    UI_BINDS_RESET, UI_BINDS_RESET_DESC,
+    UI_BINDS_RESET, UI_BINDS_RESET_DESC, UI_BINDS_SWAP_AB, UI_BINDS_SWAP_AB_DESC,
     // the actions, in action order (input_map.h B_A .. B_SHAKE)
     UI_BIND_A, UI_BIND_B, UI_BIND_X, UI_BIND_Y, UI_BIND_LCLICK, UI_BIND_RCLICK, UI_BIND_L, UI_BIND_R, UI_BIND_ZL,
     UI_BIND_ZR, UI_BIND_PLUS, UI_BIND_MINUS, UI_BIND_LEFT, UI_BIND_UP, UI_BIND_RIGHT, UI_BIND_DOWN,

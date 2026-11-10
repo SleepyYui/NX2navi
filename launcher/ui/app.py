@@ -8,7 +8,7 @@ The window is one Tk canvas at 1000 x 640 logical pixels, scaled to the display.
 flat cells and the orange choices are canvas items. Screens:
 
     first_run   the dump, the install folder, three choices and Begin Installation
-    home        Play, Updates, the game folder, Saves, Rebuild the Game, Customize Launcher, Settings
+    home        Play, Updates, the game folder, Saves, Export Game, Rebuild the Game, Customize Launcher, Settings
     customize   the colour scheme, the player's own background picture, animations and sounds
     saves       Export Save (a zip for a bug report or another player), Import a Save (such a zip), a save folder
     job         the steps of an install, update or rebuild, with their progress, and Cancel; after a failure Try Again
@@ -623,6 +623,9 @@ class App:
     def on_close(self):
         if self.job and self.job.result is None:
             self.job.cancel()
+            if self.job.kind == 'export':
+                self.job.after = 'close'
+                return
         if self.bg.staging():   # what it downloaded is resumed, and its unfinished folder replaced, next time
             self.bg.job.cancel()
         self.sounds.stop()
@@ -880,6 +883,9 @@ class App:
                 desc=('Open the game folder. The game keeps your save in its profile folder, its settings in '
                       'nx2navi.ini and its logs in logs. Its saves folder holds saves to import and backups.',)),
             self.saves_row(gd),
+            Row('value', 'Export Game', 'Portable ZIP', 'arrow', on=self.export_game,
+                desc=('Copy the game, settings and saves into a ZIP for your own devices. '
+                      'Extract it and run ocarina.exe on Windows or with Wine or Proton.',)),
             Row('value', 'Rebuild the Game', rebuild_value, rebuild_style, on=self.start_rebuild,
                 desc=('Build the game again from the files of the last build. Only what changed is compiled. Use it '
                       'after changing build tools, or if the game stopped starting.',)),
@@ -1068,6 +1074,18 @@ class App:
             self.settings['save_export_dir'] = str(Path(d))
             self.settings.save()
         self.show('saves', self.focus)
+
+    def export_game(self):
+        gd = self.settings.get('game_dir')
+        if self.game_proc and self.game_proc.poll() is None:
+            self.message = 'Close the game before exporting.'
+            self.show('home', self.focus)
+            return
+        out = filedialog.asksaveasfilename(parent=self.root, title='Export Game', defaultextension='.zip',
+                                           filetypes=[('ZIP archive', '*.zip')], initialdir=saves.default_export_dir(),
+                                           initialfile='Ocarina of Time Portable.zip')
+        if out and not (self.job and self.job.result is None):
+            self.run_job(jobs.ExportJob(self.ctx, gd, out), 'home')
 
     def export_save(self):
         gd = self.settings.get('game_dir')
@@ -1422,6 +1440,8 @@ class App:
         cur = j.current()
         lines = [ln for ln in j.lines if ln.strip() and not ln.startswith('@@')][-6:]
         if j.result == 'failed':
+            if j.kind == 'export':
+                return {'title': 'The Export Stopped', 'text': [self.friendly(j.error)]}
             return {'title': 'The Build Stopped' if j.kind != 'update' or cur.id not in ('download', 'verify')
                     else 'The Update Stopped',
                     'text': [self.friendly(j.error), 'Nothing in your game folder was changed.' if cur.id not in
@@ -1453,7 +1473,8 @@ class App:
                 'exefs': 'Unpacking the Program', 'romfs': 'Packing the Game Data', 'lift': 'Translating the Code',
                 'compile': 'Compiling', 'compile_changed': 'Compiling Changed Files', 'shaders': 'Preparing the Shaders',
                 'prompts': 'Drawing the Button Prompts', 'scan': 'Checking the Game Files', 'ready': 'Ready to Play',
-                'download': 'Downloading', 'verify': 'Verifying', 'swap': 'Swapping In the New Build'}.get(st.id,
+                'download': 'Downloading', 'verify': 'Verifying', 'swap': 'Swapping In the New Build',
+                'export': 'Exporting the Game'}.get(st.id,
                                                                                                          st.label)
 
     @staticmethod
@@ -1475,6 +1496,8 @@ class App:
             self.run_job(jobs.RebuildJob(self.ctx, j.game_dir, j.dump), self.job_return)
         elif isinstance(j, jobs.UpdateDownloadJob):
             self.run_job(jobs.UpdateDownloadJob(self.ctx, j.release), self.job_return)
+        elif isinstance(j, jobs.ExportJob):
+            self.run_job(jobs.ExportJob(self.ctx, j.game_dir, j.out), self.job_return)
 
     def copy_report(self):
         j = self.job
@@ -1498,6 +1521,9 @@ class App:
     def job_finished(self):
         j = self.job
         winsys.keep_awake(False)
+        if j.after == 'close':
+            self.on_close()
+            return
         self.ctx.log(f'job {j.kind}: {j.result} {j.error}')
         if j.result in ('ok', 'failed'):
             self.sounds.play('select' if j.result == 'ok' else 'back')
@@ -1513,6 +1539,12 @@ class App:
                 self.drop_build_cache()
             if j.kind == 'install':
                 self.message = 'The game is built. Select Play.'
+            elif j.kind == 'export':
+                self.message = f'Exported the game to {j.out}.'
+                try:
+                    winsys.reveal(j.out)
+                except OSError:
+                    pass
             elif j.kind in ('update', 'rebuild'):
                 self.message = 'The game is rebuilt and up to date.' if j.kind == 'rebuild' else \
                     f'NX2navi is now {versions.display(self.layout.version)}.'

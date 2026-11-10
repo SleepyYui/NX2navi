@@ -180,14 +180,7 @@ static void scene_menu(float w, float h, float scale, ImFont *title, bool first)
     ImGui::TextDisabled("|");
     ImGui::SameLine();
     ImGui::TextUnformatted(menu_text(UI_MENU_TITLE));
-    const float title_end = ImGui::GetItemRectMax().x;
     ImGui::PopFont();
-    const char *version = "NX2navi 0.5.0  -  game 1.1.1";
-    float version_x = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(version).x;
-    if (ImGui::GetWindowPos().x + version_x >= title_end + ImGui::GetStyle().ItemSpacing.x * 2) {
-        ImGui::SameLine(version_x);
-        ImGui::TextDisabled("%s", version);
-    }
     const ImGuiStyle &st = ImGui::GetStyle();
     float bottom = ImGui::GetFrameHeight() + st.ItemSpacing.y * 2;
     static const UiTextId tabs[] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND, UI_MENU_TAB_CONTROLS};
@@ -254,7 +247,6 @@ static void scene_overlay(float w, float h, float scale) {
     s.gpu_pct = 56, s.gpu_temp_c = 69, s.gpu_power_w = 107, s.gpu_clock_mhz = 1312, s.vram_used_mb = 5.3f * 1024,
     s.vram_total_mb = 20.0f * 1024;
     s.replay_ms = 0.60f, s.gpu_ms = 1.28f, s.pipe_wait_ms = 0, s.xlate_ms = 0, s.tex_uploads = 0;
-    p.version = "NX2navi 0.5.0, game 1.1.1";
     snprintf(p.picture[0], 64, "1920x1080");
     snprintf(p.picture[1], 64, "2560x1440");
     snprintf(p.picture[3], 64, "AMD FSR 3.1 Performance");

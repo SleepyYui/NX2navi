@@ -77,7 +77,6 @@ int frame_limit_adjustable(void);
 int rtss_limit_state(void);
 int frame_free_running(void);
 extern const int rt_game_version;
-extern const char rt_port_version[];
 void cheats_frame(uint64_t frame);   // cheats.c
 bool tab_cheats(float scale);        // ui/cheats_tab.cpp; true: restart into the rebuild
 }
@@ -1415,18 +1414,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
         ImGui::SameLine();
         ImGui::TextUnformatted(menu_text(UI_MENU_TITLE));
     }
-    const float title_end = ImGui::GetItemRectMax().x;
     if (g_title_font) ImGui::PopFont();
-    // the port version and the game update, right-aligned on the title line: what a bug report needs first; left out
-    // where it would run into the title (a narrow window, a long title)
-    char game[16], version[96];
-    snprintf(game, sizeof game, "%d.%d.%d", rt_game_version / 100, rt_game_version / 10 % 10, rt_game_version % 10);
-    snprintf(version, sizeof version, "NX2navi %s  -  game %s", rt_port_version, game);
-    float version_x = win_s.x - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(version).x;
-    if (win_p.x + version_x >= title_end + ImGui::GetStyle().ItemSpacing.x * 2) {
-        ImGui::SameLine(version_x);
-        ImGui::TextDisabled("%s", version);
-    }
 
     int step = g_modal || binds_modal()                                                                  ? 0
              : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
@@ -1619,16 +1607,6 @@ static void perf_picture(const MenuTarget *t, PerfPanel *p) {
 static void perf_full_draw(const MenuTarget *t, float scale) {
     static PerfPanel p;
     perfmon_snapshot(&p.s);
-    // the port version and the game update, formatted once per menu language
-    static char ver[96];
-    static const char *ver_fmt;
-    if (ver_fmt != menu_text(UI_MENU_VERSION)) {
-        ver_fmt = menu_text(UI_MENU_VERSION);
-        char game[16];
-        snprintf(game, sizeof game, "%d.%d.%d", rt_game_version / 100, rt_game_version / 10 % 10, rt_game_version % 10);
-        snprintf(ver, sizeof ver, ver_fmt, rt_port_version, game);
-    }
-    p.version = ver;
     perf_picture(t, &p);
     p.fg_fps = gfx_output_fps() > 0 ? (float)gfx_output_fps() : 0;
     p.under_menu = g_open.load(std::memory_order_relaxed) != 0;

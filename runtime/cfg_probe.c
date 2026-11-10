@@ -488,6 +488,20 @@ int probe_cfg(void) {
     CHECK(!line[0] && input_map_pads_of(&mp, B_A, PAD_LAYOUT_NINTENDO, ps, 8) == 1 && ps[0] == PAD_EAST,
           "edit: swapping back restores every layout's defaults");
     mp = input_map;
+    input_map_set_key(&mp, B_A, 0, KEY_J);
+    input_map_swap_ab(&mp, PAD_LAYOUT_NINTENDO);
+    input_map_line(&mp, B_A, line, sizeof line);
+    CHECK(!strcmp(line, "key:j, key:lshift, pad:south"), "swap A/B: keep the custom keyboard binding");
+    input_map_line(&mp, B_B, line, sizeof line);
+    CHECK(!strcmp(line, "key:default, pad:east"), "swap A/B: save the new controller binding for B");
+    input_map_line(&mp, B_X, line, sizeof line);
+    CHECK(!line[0], "swap A/B: leave X on the layout's default");
+    input_map_swap_ab(&mp, PAD_LAYOUT_NINTENDO);
+    input_map_line(&mp, B_A, line, sizeof line);
+    CHECK(!strcmp(line, "key:j, key:lshift, pad:default"), "swap A/B twice: follow the layout again");
+    input_map_line(&mp, B_B, line, sizeof line);
+    CHECK(!line[0], "swap A/B twice: restore B's default");
+    mp = input_map;
     input_map_set_key(&mp, B_SL_UP, 0, KEY_NONE);
     input_map_line(&mp, B_SL_UP, line, sizeof line);
     CHECK(!strcmp(line, "none"), "edit: a stick direction without keys is none");

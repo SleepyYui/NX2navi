@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 
-from . import build, feed, gamefiles, net, toolchain, updater, versions, winsys
+from . import build, feed, game_export, gamefiles, net, toolchain, updater, versions, winsys
 
 RECHECK = 3600   # seconds between update checks while the launcher stays open, hidden during play included
 
@@ -35,9 +35,11 @@ STEPS = {
     'download': ('Download {ver}', 'Downloading the new version of NX2navi.'),
     'verify': ('Verify the Download', 'Checking the download against its checksum.'),
     'swap': ('Swap In the New Build', 'Linking the new build. It replaces the old one only once it is complete.'),
+    'export': ('Export Game', 'Copying the built game, settings and saves into a portable ZIP.'),
 }
 WEIGHTS = {'tools': 12, 'tools_update': 4, 'check': 1, 'exefs': 2, 'romfs': 14, 'lift': 14, 'compile': 55,
-           'compile_changed': 55, 'shaders': 18, 'prompts': 4, 'scan': 5, 'ready': 0, 'download': 8, 'verify': 1, 'swap': 6}
+           'compile_changed': 55, 'shaders': 18, 'prompts': 4, 'scan': 5, 'ready': 0, 'download': 8, 'verify': 1,
+           'swap': 6, 'export': 1}
 
 
 def prompt_rows(ctx):
@@ -340,6 +342,23 @@ class RebuildJob(Job):
         for sid in ('lift', 'compile_changed', 'swap', 'shaders', 'prompts', 'scan'):
             if self.step(sid) and self.step(sid).state == PENDING:
                 self.skip(sid)
+
+
+class ExportJob(Job):
+    kind = 'export'
+
+    def __init__(self, ctx, game_dir, out):
+        super().__init__(ctx, ['export'])
+        self.game_dir, self.out = game_dir, out
+
+    def run(self):
+        self.begin('export')
+
+        def progress(done, total):
+            self.progress('export', done / max(total, 1), f'{done / 1e9:.1f} of {total / 1e9:.1f} GB copied')
+
+        self.out = game_export.export(self.game_dir, self.out, progress=progress, cancel=self.cancelled)
+        self.finish('export')
 
 
 class UpdateDownloadJob(Job):

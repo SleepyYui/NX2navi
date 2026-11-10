@@ -64,7 +64,7 @@ identity (`NX2navi.Launcher`), so the taskbar groups and pins it under NX2navi r
 
 Screens (`launcher/ui/app.py`): first run (dump, install folder, Desktop Shortcut, Check for Updates at Start,
 Update Channel, Begin Installation); the steps of an install, update or rebuild with their progress, the build log's
-last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Saves,
+  last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Saves, Export Game,
 Rebuild the Game, Customize Launcher, Settings); customize (Color Scheme, Background, with a picture set Background
 Dimming and Remove Background, Animations, Sounds, Back); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
 Open Saves Folder, Back); settings (update check, Install Updates Automatically, Hide Launcher While Playing, Keep
@@ -75,6 +75,22 @@ Controls: the mouse (hover moves the cursor, a click selects); the keyboard (arr
 for updates); an XInput gamepad (d-pad or left stick, A, B, Y) while the window is in front.
 
 `python -m launcher --selftest --shots DIR` draws every screen with made-up states and saves a PNG of each.
+
+## Exporting the game
+
+Close the game, then select **Export Game** on the launcher's home screen and choose where to save the ZIP. It
+includes the built game and its assets, the local saves and the game settings, including controller bindings. The
+export uses the destination's devices and the files beside its executable. It leaves out the build cache and logs.
+The archive is for use on your own devices and contains files derived from your game.
+
+Extract the whole archive with a ZIP64-capable tool such as 7-Zip. On Windows, open `ocarina.exe`. On Linux,
+run `wine ocarina.exe` from the extracted folder or add the executable to Steam as a non-Steam game and enable
+Proton. For Steam Frame, upload the extracted folder with the SteamOS Devkit Client and select Steam Play (Proton)
+for Windows. Use `ocarina.exe` as the launch command. The CPU target comes from the installed build, and the
+destination needs a compatible Vulkan 1.3 driver with `VK_EXT_external_memory_host` and `VK_EXT_depth_clip_control`.
+
+The command-line equivalent is
+`python -m launcher.cli export --game "C:\Games\Ocarina" --out "D:\Ocarina Portable.zip"`.
 
 ## The launcher's folder
 

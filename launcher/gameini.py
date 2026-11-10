@@ -58,6 +58,15 @@ def get(game_dir, key):
     return value
 
 
+def portable_text(game_dir):
+    """Keep settings and bindings, using the exported game's own files and the destination's devices."""
+    local = {'EXEFS', 'ROMFS', 'ROMFS_INDEX', 'ROMFS_PATCHES', 'ROMFS_PROOF_DIR', 'ROMFS_MODS', 'PROFILE_DIR',
+             'SHARED_FONTS', 'XLATE', 'XLATE_ID', 'SHADER_CACHE', 'PIPELINE_CACHE', 'MODS_DIR', 'GPU_INDEX',
+             'GPU_NAME', 'MONITOR', 'AUDIO_DEVICE'}
+    return ''.join(line for line in _text(game_dir).splitlines(keepends=True)
+                   if (_setting(line) or ('',))[0] not in local)
+
+
 def put(game_dir, section, key, value):
     """Write key = value: on the key's last line that has a value (else its last line) when the file has one, else
     under [section] (made at the end when the file has none). Raises OSError, the file unchanged, when it exists but
