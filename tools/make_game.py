@@ -543,13 +543,19 @@ def copy_if_changed(src, dst):
             return False
     except FileNotFoundError:
         pass
+    # Some SMB servers reject TemporaryDirectory's mode-0700 directories while allowing ordinary files beside dst.
+    replacement = None
     try:
-        with tempfile.TemporaryDirectory(dir=dst.parent, prefix='.nx2navi-copy-') as tmp:
-            replacement = Path(tmp) / dst.name
-            shutil.copy2(src, replacement)
-            os.replace(replacement, dst)
+        fd, name = tempfile.mkstemp(dir=dst.parent, prefix='.nx2navi-copy-')
+        os.close(fd)
+        replacement = Path(name)
+        shutil.copy2(src, replacement)
+        os.replace(replacement, dst)
     except PermissionError:
         fail(f'cannot replace {dst}: close the game and check output-directory permissions')
+    finally:
+        if replacement is not None:
+            replacement.unlink(missing_ok=True)
     return True
 
 
