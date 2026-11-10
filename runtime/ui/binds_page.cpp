@@ -107,9 +107,9 @@ static int shown_layout(void) {
 }
 
 // Writes the bind_ line of every action whose line for m differs from the one set; a line at the defaults goes away.
-static void write_lines(const InputMap *m) {
-    for (int a = 0; a < ACTION_COUNT; a++) {
-        char var[40], line[256];
+static void write_lines(const InputMap *m, int first = 0, int end = ACTION_COUNT) {
+    for (int a = first; a < end; a++) {
+        char var[40], line[INPUT_BIND_LINE_MAX];
         snprintf(var, sizeof var, "NX2NAVI_BIND_%s", input_action_name(a));
         input_map_line(m, a, line, sizeof line);
         const char *now = cfg_get(var);
@@ -233,6 +233,11 @@ void binds_rows(float scale) {
     int layout = shown_layout();
     opt_group(UI_BINDS_GROUP_BUTTONS);
     opt_text(UI_BINDS_HELP);
+    if (opt_button("##binds_swap_ab", UI_BINDS_SWAP_AB, UI_BINDS_SWAP_AB_DESC)) {
+        input_map_swap_ab(&m, layout);
+        write_lines(&m, B_A, B_B + 1);
+        set_note(B_A, UI_BINDS_SWAPPED, action_label(B_A), action_label(B_B));
+    }
     opt_bind_header(UI_BINDS_COL_KEY1, UI_BINDS_COL_KEY2, UI_BINDS_COL_PAD);
     for (int a : kButtons) row_action(a, m, layout);
     opt_group(UI_BINDS_GROUP_MOVE);

@@ -131,7 +131,7 @@ int input_map_bind(const char *button, const char *list) {
     if (action < 0) { rt_log("input: bind: unknown button '%s'", button); return 0; }
     uint8_t keys[INPUT_BINDING_MAX], pads[INPUT_PAD_BINDING_MAX];
     int nk = 0, np = 0, none = 0, key_def = 0, pad_def = 0, bad = 0;
-    char buf[256];
+    char buf[INPUT_BIND_LINE_MAX];
     snprintf(buf, sizeof buf, "%s", list);
     for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
         tok = trim(tok);
@@ -251,6 +251,28 @@ int input_map_set_pad(InputMap *m, int action, int layout, int pad) {
     return other;
 }
 
+void input_map_swap_ab(InputMap *m, int layout) {
+    uint8_t a[INPUT_PAD_BINDING_MAX], b[INPUT_PAD_BINDING_MAX];
+    int na = input_map_pads_of(m, B_A, layout, a, INPUT_PAD_BINDING_MAX);
+    int nb = input_map_pads_of(m, B_B, layout, b, INPUT_PAD_BINDING_MAX);
+    uint8_t da[INPUT_PAD_BINDING_MAX], db[INPUT_PAD_BINDING_MAX];
+    int nda = input_map_pads_of(&defaults, B_A, layout, da, INPUT_PAD_BINDING_MAX);
+    int ndb = input_map_pads_of(&defaults, B_B, layout, db, INPUT_PAD_BINDING_MAX);
+    int restore = same_set(b, nb, da, nda) && same_set(a, na, db, ndb);
+    for (int l = 0; l < PAD_LAYOUT_COUNT; l++) {
+        // A custom binding names a physical button. When both are back at their defaults, follow the layout again.
+        if (restore) {
+            nb = input_map_pads_of(&defaults, B_A, l, b, INPUT_PAD_BINDING_MAX);
+            na = input_map_pads_of(&defaults, B_B, l, a, INPUT_PAD_BINDING_MAX);
+        }
+        // Remove both sets first so a full table still has room for every button.
+        pads_put(m, l, B_A, NULL, 0);
+        pads_put(m, l, B_B, NULL, 0);
+        pads_put(m, l, B_A, b, nb);
+        pads_put(m, l, B_B, a, na);
+    }
+}
+
 // The same bindings in any order (the menu appends; a line lists them its own way).
 static int same_set(const uint8_t *a, int na, const uint8_t *b, int nb) {
     if (na != nb) return 0;
@@ -263,6 +285,7 @@ static int same_set(const uint8_t *a, int na, const uint8_t *b, int nb) {
 }
 
 void input_map_line(const InputMap *m, int action, char *out, size_t n) {
+    if (!n) return;
     uint8_t k[INPUT_BINDING_MAX], dk[INPUT_BINDING_MAX];
     int nk = input_map_keys_of(m, action, k, INPUT_BINDING_MAX);
     int key_def = same_set(k, nk, dk, input_map_keys_of(&defaults, action, dk, INPUT_BINDING_MAX));
@@ -275,7 +298,7 @@ void input_map_line(const InputMap *m, int action, char *out, size_t n) {
     out[0] = 0;
     if (key_def && pad_def) return;
     size_t len = 0;
-#define PUT(...) (len += (size_t)snprintf(out + len, len < n ? n - len : 0, __VA_ARGS__))
+#define PUT(...) do { if (len < n) len += (size_t)snprintf(out + len, n - len, __VA_ARGS__); } while (0)
     if (key_def) PUT("key:default");
     else
         for (int i = 0; i < nk; i++) PUT("%skey:%s", len ? ", " : "", key_names[k[i]]);

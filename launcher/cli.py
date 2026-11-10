@@ -5,6 +5,7 @@
     python -m launcher.cli tools                       install the build tools and zbic
     python -m launcher.cli install --dump F --game D   build the game (the window's Begin Installation)
     python -m launcher.cli rebuild [--game D]          rebuild after an update (the window's Rebuild the Game)
+    python -m launcher.cli export --out F [--game D] [--minimal]  export the built game as a portable ZIP
     python -m launcher.cli fonts [--dump F]            decode the game's font for the window
     python -m launcher.cli continue-update OLD         what the new version runs after `update`
 
@@ -58,6 +59,10 @@ def main(argv=None):
     p.add_argument('--game', required=True)
     p = sub.add_parser('rebuild')
     p.add_argument('--game')
+    p = sub.add_parser('export')
+    p.add_argument('--game')
+    p.add_argument('--out', required=True)
+    p.add_argument('--minimal', action='store_true', help='omit saves, settings, shader caches and optional mods')
     p = sub.add_parser('fonts')
     p.add_argument('--dump', default='')
     p.add_argument('--game', default='')
@@ -112,11 +117,23 @@ def main(argv=None):
         s.save()
         return follow(jobs.InstallJob(ctx, s['dump'], s['game_dir']))
 
-    if a.cmd == 'rebuild':
+    if a.cmd in ('rebuild', 'export'):
         gd = os.path.abspath(a.game) if a.game else s.get('game_dir')
         if not gd:
             print('error: no game folder (give --game)', file=sys.stderr)
             return 1
+        if a.cmd == 'export':
+            job = jobs.ExportJob(ctx, gd, a.out, minimal=a.minimal)
+            try:
+                code = follow(job)
+            except KeyboardInterrupt:
+                job.cancel()
+                while job.result is None:
+                    time.sleep(0.1)
+                return 3
+            if not code:
+                print(f'Exported to {job.out}')
+            return code
         return follow(jobs.RebuildJob(ctx, gd, s.get('dump')))
 
     if a.cmd == 'fonts':

@@ -202,9 +202,6 @@ void perf_panel_draw(const PerfPanel *p, float width, float scale) {
     dl->ChannelsSplit(2);   // the panel goes under the text, drawn once the window's size is known
     dl->ChannelsSetCurrent(1);
     ImGui::SetWindowFontScale(0.72f);
-    // the port version and the game update first, so a screenshot in a bug report carries both
-    ImGui::TextColored(kDimText, "%s", p->version);
-    divider(scale);
     machine_and_frames(p, scale);
     ImGui::Dummy(ImVec2(0, 4 * scale));
     frame_plot(p->s, scale);

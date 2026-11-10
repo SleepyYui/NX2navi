@@ -108,10 +108,10 @@ class Run:
                 pass
 
 
-def game_running(game_dir, exe='ocarina.exe'):
+def game_running(game_dir, exe='ocarina.exe', *, clear_readonly=True):
     """True when the built game runs from game_dir: Windows refuses to open a running exe for writing. A read-only
     exe (a copy restored from a backup or read-only media) is refused too, though nothing runs it: its read-only
-    attribute is cleared and the open tried again, as the next build replaces the file anyway."""
+    attribute is cleared and the open tried again for rebuilds. Read-only callers leave the attribute in place."""
     path = os.path.join(str(game_dir), exe)
     if os.name != 'nt' or not os.path.isfile(path):
         return False
@@ -120,7 +120,7 @@ def game_running(game_dir, exe='ocarina.exe'):
             with open(path, 'r+b'):
                 return False
         except PermissionError:
-            if attempt or not os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY:
+            if attempt or not clear_readonly or not os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY:
                 return True
             try:
                 os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
