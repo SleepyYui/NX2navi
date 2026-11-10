@@ -1351,6 +1351,16 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
             tmp.unlink(missing_ok=True)
             fail(f'{exe} is in use: close the game and try again')
         state_link.write_text(link_key, encoding='utf-8')
+    if WIN:
+        helper = out / 'Prepare Graphics.exe'
+        tmp = helper.with_suffix('.new')
+        p = subprocess.run([str(clang), '-O2', '-Wall', '-municode', '-Wl,-s', '-o', str(tmp),
+                            str(rt / 'tools/prepare_graphics.c')], capture_output=True, text=True, env=env,
+                           errors='replace')
+        if p.returncode:
+            tmp.unlink(missing_ok=True)
+            fail(f'could not build {helper.name}: {p.stderr.strip()}')
+        os.replace(tmp, helper)
     copy_if_changed(gen / 'romfs-index.bin', out / 'romfs-index.bin')
     xlate = xlate_source()
     note_cache_translator(out)   # before the new translator replaces the one the shader cache was made with
@@ -1767,7 +1777,7 @@ def step_key(step, identity, out=None):
     compile_key = (f'compile|{lift}|{tree_digest(KIT / "runtime", ("**/*",))}|{sha256_file(Path(__file__))}|{kit_version()}'
                    f'|cpu {cpu_tag()}')
     if step == 'compile':
-        return compile_key
+        return compile_key + ('|graphics tool missing' if WIN and not (out / 'Prepare Graphics.exe').is_file() else '')
     # shaders: the built game and the translator that prepared them, the one xlate_source finds (the kit's bin/, or a
     # source checkout's build/xlate/)
     return (f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}'

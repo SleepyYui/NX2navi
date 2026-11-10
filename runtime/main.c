@@ -514,7 +514,7 @@ static int usage(const char *argv0) {
                     "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
                     "--probe-vkexec | --probe-astc | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
-                    "--prepare-shaders | --warm-shaders | --probe-prewarm | --boot |--seconds S [--shot PNG]]\n", argv0);
+                    "--prepare-shaders | --warm-shaders | --check-graphics | --prepare-graphics | --probe-prewarm | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
 
@@ -571,7 +571,8 @@ int main(int argc, char **argv) {
     // threads, so narrowing them to one die would only make the preparation take longer.
     int prepare = 0;
     for (int i = 1; i < argc; i++)
-        if (!strcmp(argv[i], "--prepare-shaders") || !strcmp(argv[i], "--warm-shaders")) prepare = 1;
+        if (!strcmp(argv[i], "--prepare-shaders") || !strcmp(argv[i], "--warm-shaders") ||
+            !strcmp(argv[i], "--prepare-graphics")) prepare = 1;
     if (!prepare) perf_cpu_start();
     {   // NX2NAVI_POWER_FULL=0 leaves Windows' power throttling of an unfocused window in place (A/B runs)
         const char *pf = cfg_get("NX2NAVI_POWER_FULL");
@@ -664,6 +665,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-movie")) return probe_movie();
     if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
     if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
+    if (!strcmp(mode, "--check-graphics")) return vk_pipeline_prepare_graphics(1);
+    if (!strcmp(mode, "--prepare-graphics")) return vk_pipeline_prepare_graphics(0);
     if (!strcmp(mode, "--probe-prewarm")) return vk_pipeline_probe_prewarm();
     if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
     return usage(argv[0]);

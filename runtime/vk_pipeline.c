@@ -3829,7 +3829,7 @@ void vk_pipeline_prewarm_progress(VkPrewarmProgress *p) {
     p->pipe_total = __atomic_load_n(&pw_pipe_total, __ATOMIC_RELAXED);
 }
 
-static void prewarm_run(void);
+static int prewarm_run(int offline);
 
 // The boot's share of the pipeline prebuild with the graphics pipeline library. The boot builds the recorded
 // pipelines in record order, so those met first in play (the title screen, the first places) come first, for at most
@@ -3842,24 +3842,25 @@ static void prewarm_run(void);
 #define PREWARM_PIPE_MS 20000.0
 
 void vk_pipeline_prewarm(void) {
-    prewarm_run();
+    prewarm_run(0);
     __atomic_store_n(&pw_phase, 3, __ATOMIC_RELEASE);
 }
 
-static void prewarm_run(void) {
+static int prewarm_run(int offline) {
     const char *gpu = rt_config()->gpu;
     uint32_t pr_hist[16] = {0}, fs_hist[4] = {0};   // library state of the recorded pipelines (lb_start)
-    if (!A.on || (gpu && !strcmp(gpu, "null"))) return;
-    if (!cfg_bool("NX2NAVI_PIPE_PREBUILD")) {   // prebuild_start logs the off case
+    if (!A.on || (gpu && !strcmp(gpu, "null"))) return 1;
+    if (!offline && !cfg_bool("NX2NAVI_PIPE_PREBUILD")) {   // prebuild_start logs the off case
         if (ensure_init()) lb_start(pr_hist, fs_hist);
-        return;
+        return 0;
     }
     double t0 = now_ms();
     K.warm = 1;
     if (!ensure_init() || !K.file_n) {
         rt_log("vk_pipeline: prewarm: no pipeline keys (%s)", K.path[0] ? K.path : "<none>");
-        if (P.ready) lb_start(pr_hist, fs_hist);
-        return;
+        if (!offline && P.ready) lb_start(pr_hist, fs_hist);
+        if (offline) puts("No recorded pipelines are available. Mesh pipelines without recorded draw state build during play.");
+        return !P.ready;
     }
     const KeyRec *r = (const KeyRec *)K.file;
     size_t n = K.file_n, m = 0;
@@ -3867,7 +3868,7 @@ static void prewarm_run(void) {
     const GfxShader **sh = calloc(3 * n, sizeof *sh);
     if (!ids || !sh) {
         free(ids), free(sh);
-        return;
+        return 1;
     }
     for (size_t i = 0; i < n; i++) {
         memcpy(ids[m++], r[i].vs, 32);
@@ -3906,11 +3907,12 @@ static void prewarm_run(void) {
         K.file = NULL;
         plat_mutex_unlock(&P.lock);
         free(ids), free(sh);
-        lb_start(pr_hist, fs_hist);
-        return;
+        if (offline) puts("Recorded pipelines skipped after a previous driver crash. See pipeline-prewarm-skip.txt.");
+        else lb_start(pr_hist, fs_hist);
+        return 1;
     }
     pm_set();
-    uint32_t queued = 0, dropped = 0, known = 0;
+    uint32_t queued = 0, dropped = 0, known = 0, mesh = 0, rejected = 0, synchronous = 0, mesh_skipped = 0;
     plat_mutex_lock(&P.lock);
     K.t0 = t1;
     K.loading = 1;
@@ -3930,11 +3932,22 @@ static void prewarm_run(void) {
         if (!is_mesh(&s)) {   // the stage libraries lb_start prebuilds are for vertex pipelines
             pr_hist[(k.clamp & 1) | (k.poly_mode & 3) << 1 | (k.minus_w & 1) << 3]++;
             fs_hist[k.samples >= 8 ? 3 : k.samples >= 4 ? 2 : k.samples >= 2 ? 1 : 0]++;
+        } else {
+            mesh++;
+            if (offline && !vk_ctx()->has_mesh_shader) {
+                mesh_skipped++;
+                continue;
+            }
         }
         uint64_t h = key_hash(&k, sizeof k);
         int q = 0;
         if (pipe_find(&k, sizeof k, h)) known++;
-        else pipe_miss(&s, &k, h, 2, &q), queued += (uint32_t)q;
+        else {
+            Pipe *p = pipe_miss(&s, &k, h, 2, &q);
+            if (q) queued++;
+            else if (p && p->info.pipeline) synchronous++;
+            else rejected++;
+        }
     }
     K.loading = 0;
     plat_mutex_unlock(&P.lock);
@@ -3944,7 +3957,7 @@ static void prewarm_run(void) {
     __atomic_store_n(&pw_pipe_total, (int64_t)queued, __ATOMIC_RELAXED);
     __atomic_store_n(&pw_phase, 2, __ATOMIC_RELEASE);
     const char *full = cfg_get("NX2NAVI_PREWARM_FULL");
-    K.until = P.gpl && !(full && !strcmp(full, "1")) ? now_ms() + PREWARM_PIPE_MS : 0;   // before the builders start
+    K.until = !offline && P.gpl && !(full && !strcmp(full, "1")) ? now_ms() + PREWARM_PIPE_MS : 0;
     PlatThread *t[64];
     int nt = 0;
     for (int i = 0; i < cpus && i < 64 && queued; i++)
@@ -3957,6 +3970,7 @@ static void prewarm_run(void) {
             __atomic_store_n(&pw_pipe_done, (int64_t)fin, __ATOMIC_RELAXED);
             if (now_ms() - logged < 2000) continue;
             logged = now_ms();
+            if (offline) printf("Recorded pipelines processed: %u of %u\n", fin, queued);
             rt_log("vk_pipeline: prewarm: %u of %u pipelines, %.0f ms", fin, queued, now_ms() - t1);
         }
     __atomic_store_n(&pw_pipe_done, (int64_t)queued, __ATOMIC_RELAXED);
@@ -3977,7 +3991,14 @@ static void prewarm_run(void) {
     fb_log("after the boot prewarm");
     vk_mem_stage_log("the recorded pipelines' prebuild");
     vk_pipeline_prewarm_marker_clear();   // the boot's share is done; what the pool builds later runs during play
-    lb_start(pr_hist, fs_hist);
+    if (!offline) {
+        lb_start(pr_hist, fs_hist);
+        return 0;
+    }
+    printf("Recorded pipeline preparation: %u built, %u duplicates, %u failed, %u missing shader inputs "
+           "(%u mesh records with shader inputs, %u skipped for lack of mesh support).\n",
+           K.built + synchronous, known, K.failed + rejected, dropped, mesh, mesh_skipped);
+    return K.failed || rejected || dropped || mesh_skipped;
 }
 
 // ---- boot prebuild crash marker
@@ -5504,15 +5525,23 @@ static void lb_warm_worker(void *arg) {
             LB.noshader++;
             plat_mutex_unlock(&LB.stat);
         } else if (st == GFX_STAGE_CS) {
-            Bindings B = {0};
-            const char *why = NULL;
-            lb_lock();
-            Layout *l = compute_layout(sh, &B, &why);
-            lb_unlock();
-            double t0 = now_ms();
-            VkPipeline pipe = l ? compute_create(sh, l, 0) : VK_NULL_HANDLE;
-            if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-            lb_count(2, pipe ? 3 : 2, now_ms() - t0);
+            uint64_t words;
+            gfx_shader_spirv(sh, &words);
+            if (LB.big_words && words > LB.big_words) {
+                plat_mutex_lock(&LB.stat);
+                LB.deferred++;
+                plat_mutex_unlock(&LB.stat);
+            } else {
+                Bindings B = {0};
+                const char *why = NULL;
+                lb_lock();
+                Layout *l = compute_layout(sh, &B, &why);
+                lb_unlock();
+                double t0 = now_ms();
+                VkPipeline pipe = l ? compute_create(sh, l, 0) : VK_NULL_HANDLE;
+                if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
+                lb_count(2, pipe ? 3 : 2, now_ms() - t0);
+            }
         } else if (st == GFX_STAGE_VS || st == GFX_STAGE_FS) {
             if (P.gpl) lb_library(sh, st == GFX_STAGE_VS, 0);
             else lb_skip_lib();
@@ -5527,7 +5556,7 @@ static void lb_warm_worker(void *arg) {
 }
 
 // Preparation: every variant of <dir>/shader-prepared.bin on every core at normal priority.
-static void lb_warm_prepared(const char *dir) {
+static int lb_warm_prepared(const char *dir, int offline) {
     char path[PLAT_PATH_MAX * 2 + 32];
     snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
     uint64_t size = 0;
@@ -5537,16 +5566,18 @@ static void lb_warm_prepared(const char *dir) {
     for (size_t i = 0; LB.e && i < n; i++)
         memcpy(LB.e[i].iid, f + 16 + 36 * i + 4, 32), LB.e[i].stage = f[16 + 36 * i], LB.e[i].prio = f[16 + 36 * i + 1];
     free(f);
-    if (!LB.e) return;
+    if (!LB.e) return 1;
     skip_init(dir);
     char jp[PLAT_PATH_MAX * 2 + 48];
     snprintf(jp, sizeof jp, "%s/shader-prepare-journal.bin", dir);
     SK.journal = plat_fs_create(jp, NULL);   // skip_init removed a leftover one
     if (!SK.journal) rt_log("vk_pipeline: cannot create %s: a driver crash in this run will not be recorded", jp);
     LB.n = n, LB.idle = 0, LB.t0 = now_ms();
+    LB.big_words = offline ? LB_BIG_WORDS : 0;
     static const uint32_t no_pr[16], no_fs[4];
     lb_state(no_pr, no_fs);
     int cpus = (int)plat_cpu_usable(), k = 0;
+    if (offline && cpus > 4) cpus = 4;
     PlatThread *t[JR_SLOTS];
     for (int i = 0; i < cpus && i < JR_SLOTS; i++)
         if ((t[k] = plat_thread_new(lb_warm_worker, (void *)(intptr_t)k, "lib warm"))) k++;
@@ -5572,19 +5603,26 @@ static void lb_warm_prepared(const char *dir) {
         printf("prepare-shaders: %zu variants on %d threads in %.0f ms, %llu vertex/fragment variants skipped (graphics "
                "pipeline library off, they build at their first draw)\n", tried, k, now_ms() - LB.t0,
                (unsigned long long)LB.nolib);
-    else
+    else if (!offline)
         printf("prepare-shaders: %zu variants built into the driver cache on %d threads in %.0f ms\n", tried, k,
                now_ms() - LB.t0);
     if (skipped)   // installer/steps.py Prepare reads this line
         printf("prepare-shaders: %llu variants skipped: the graphics driver crashed while building them in an earlier "
                "run (shader-prepare-skip.txt); they build at their first draw\n", skipped);
+    uint64_t failures = LB.fail[0] + LB.fail[1] + LB.fail[2];
+    if (offline)
+        printf("Shader warmup: %llu vertex libraries, %llu fragment libraries, %llu compute pipelines; "
+               "%llu failed, %llu unavailable, %llu deferred because of size.\n",
+               (unsigned long long)LB.warmed[0], (unsigned long long)LB.warmed[1], (unsigned long long)LB.warmed[2],
+               (unsigned long long)failures, (unsigned long long)LB.noshader, (unsigned long long)LB.deferred);
     free(LB.e), LB.e = NULL, LB.n = 0, LB.next = 0, LB.done = 0, LB.skipped = 0;
+    return failures || LB.noshader || skipped || LB.deferred || LB.nolib;
 }
 
 // nx2navi.exe --prepare-shaders (tools/prepare_shaders.py): the device sets the translator's host answers (they are in every
 // cache key), the seed next to nx2navi.exe is translated on every core, then every prepared variant's stage library or
 // compute pipeline is built once into the driver's disk cache (lb_warm_prepared). No game runs.
-int vk_pipeline_prepare_shaders(void) {
+static int prepare_shaders(int offline) {
     if (!ensure_init()) {
         fprintf(stderr, "prepare-shaders: no Vulkan device\n");
         return 1;
@@ -5594,8 +5632,52 @@ int vk_pipeline_prepare_shaders(void) {
     int cpus = (int)plat_cpu_usable();
     const char *pe = cfg_get("NX2NAVI_PREWARM_XLATE");   // no fixed default: half the CPUs, at most 16, when unset
     int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
-    int rc = gfx_shader_prepare_seed(dir, cpus, procs < 1 ? 1 : procs);
-    if (!rc) lb_warm_prepared(dir);
+    int rc = gfx_shader_prepare_seed(dir, cpus, procs < 1 ? 1 : procs, offline);
+    if (rc == 1) return rc;
+    int partial = lb_warm_prepared(dir, offline);
+    return offline && (rc || partial) ? 3 : 0;
+}
+
+int vk_pipeline_prepare_shaders(void) {
+    return prepare_shaders(0);
+}
+
+int vk_pipeline_prepare_graphics(int check_only) {
+    const char *gpu = rt_config()->gpu;
+    if (gpu && !strcmp(gpu, "null")) {
+        fputs("Vulkan is disabled in the game settings (GPU = null).\n", stderr);
+        return 1;
+    }
+    // This headless run prepares the game's pipelines. Frame generation only needs its vendor hooks during play.
+    cfg_setenv("NX2NAVI_FRAMEGEN", "off");
+    if (!vk_init()) {
+        fputs("Compatibility check failed. See the Vulkan device or driver errors above.\n", stderr);
+        return 1;
+    }
+    const VkCtx *c = vk_ctx();
+    uint32_t api = c->props.apiVersion;
+    printf("Selected GPU: %s (Vulkan %u.%u.%u)\n", c->props.deviceName, VK_API_VERSION_MAJOR(api),
+           VK_API_VERSION_MINOR(api), VK_API_VERSION_PATCH(api));
+    int mesh_supported = c->has_mesh_shader;
+    if (mesh_supported) {
+        puts("Vulkan compatibility check passed, including task and mesh shaders.");
+    } else {
+        fputs("Limited Vulkan compatibility. The selected GPU or driver lacks Vulkan task and mesh shaders "
+              "(VK_EXT_mesh_shader). The game skips affected graphics.\n", stderr);
+    }
+    if (check_only) return mesh_supported ? 0 : 3;
+
+    A.on = 1;
+    K.warm = 1;   // keep the recorded draw states when prepare_shaders initializes the pipeline cache
+    int rc = prepare_shaders(1);
+    if (rc == 1) {
+        fputs("Could not prepare the shader inventory. Check that the entire ZIP was extracted.\n", stderr);
+        return rc;
+    }
+    if (prewarm_run(1) || !mesh_supported) rc = 3;
+    vk_pipeline_save();
+    puts(rc ? "Graphics preparation finished with some work left for play. See the counts above."
+            : "Graphics preparation finished. New draw states can still compile during play.");
     return rc;
 }
 
@@ -5616,7 +5698,7 @@ int vk_pipeline_warm_shaders(void) {
         fprintf(stderr, "warm-shaders: no %s (tools/prepare_shaders.py writes it)\n", prp);
         return 1;
     }
-    lb_warm_prepared(dir);
+    lb_warm_prepared(dir, 0);
     return 0;
 }
 

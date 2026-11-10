@@ -2814,7 +2814,7 @@ void gfx_shader_prepare_recorded(int threads, int procs) {
 #define PRP_VERSION 1
 #define PRP_REC 36
 
-int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
+int gfx_shader_prepare_seed(const char *dir, int threads, int procs, int report_partial) {
     char ans[PATH_CAP + 32], prg[PATH_CAP + 32], out[PATH_CAP + 32];
     snprintf(ans, sizeof ans, "%s/seed-answers.bin", dir);
     snprintf(prg, sizeof prg, "%s/seed-programs.bin", dir);
@@ -2829,14 +2829,18 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     if (n < 0) return 1;
     uint8_t *recs = calloc((size_t)n + 1, PRP_REC);
     static const uint8_t zero[32];
-    size_t u = 0, by[3] = {0}, stages[8] = {0};
+    size_t u = 0, missing = 0, by[3] = {0}, stages[8] = {0};
     Set64 seen = {0};
     for (long long i = 0; recs && i < n; i++) {           // seed records come in priority order: the first id wins
-        if (!memcmp(iid[i], zero, 32) || !set_add(&seen, hash8(iid[i]))) continue;
+        if (!memcmp(iid[i], zero, 32)) {
+            missing++;
+            continue;
+        }
+        if (!set_add(&seen, hash8(iid[i]))) continue;
         uint8_t *r = recs + u * PRP_REC;
         const uint8_t *a = ab + (size_t)i * ANS_REC;
         uint8_t prio = a[ANS_REC - 1] & ~SEED_DEFAULT;
-        r[0] = a[0] < 6 ? a[0] : 0, r[1] = prio > 2 ? 2 : prio;
+        r[0] = a[0] <= GFX_STAGE_MS ? a[0] : 0, r[1] = prio > 2 ? 2 : prio;
         memcpy(r + 4, iid[i], 32);
         by[r[1]]++, stages[r[0]]++, u++;
     }
@@ -2849,15 +2853,17 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
         ok = plat_file_write_atomic(out, file, sizeof h + u * PRP_REC);
     }
     char msg[640];
-    snprintf(msg, sizeof msg, "gfx_shader: prepared %zu shader variants (vertex %zu, fragment %zu, compute %zu; title %zu, "
+    snprintf(msg, sizeof msg, "gfx_shader: prepared %zu shader variants (vertex %zu, fragment %zu, compute %zu, task %zu, mesh %zu; title %zu, "
              "warm-up %zu, other %zu) from %lld seed records, %llu translations failed, in %.0f ms; %s %s", u,
-             stages[GFX_STAGE_VS], stages[GFX_STAGE_FS], stages[GFX_STAGE_CS], by[0], by[1], by[2], n,
+             stages[GFX_STAGE_VS], stages[GFX_STAGE_FS], stages[GFX_STAGE_CS], stages[GFX_STAGE_TS], stages[GFX_STAGE_MS],
+             by[0], by[1], by[2], n,
              (unsigned long long)((uint64_t)n_failures - fail0), (double)plat_now_ms() - t0,
              ok ? "wrote" : "cannot write", out);
     rt_log("%s", msg);
     printf("%s\n", msg);
     free(file), free(recs), free(iid), free(ab);
-    return ok ? 0 : 1;
+    if (!ok || (report_partial && !u)) return 1;
+    return report_partial && missing ? 3 : 0;
 }
 
 // The variants the boot prebuild warms, most likely first: every input id play recorded (shader-answers.bin, priority

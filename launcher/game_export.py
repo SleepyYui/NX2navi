@@ -2,16 +2,19 @@
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
 
 from . import build, gameini, net
+from .paths import APP, Layout
 
 REQUIRED = ('ocarina.exe', 'SDL3.dll', 'libopus-0.dll', 'nx2navi_xlate.exe', 'romfs-index.bin', 'romfs/romfs.bin',
             'exefs/main.npdm', 'exefs/main', 'exefs/rtld', 'exefs/sdk', 'exefs/subsdk0')
-CACHE_FILES = ('shader-answers.bin', 'shader-programs.bin', 'shader-prepared.bin', 'seed-answers.bin',
-               'seed-programs.bin', 'compute-used.bin')
+CACHE_FILES = ('shader-answers.bin', 'shader-programs.bin', 'shader-prepared.bin', 'compute-used.bin', 'pipeline-keys.bin')
+GRAPHICS_TOOL = 'Prepare Graphics.exe'
+SHADER_SEEDS = ('seed-programs.bin', 'seed-answers.bin')
 OPTIONAL_GRAPHICS = {'amd_fidelityfx_vk.dll', 'nvngx_dlss.dll', 'nx2navi_dlssg.dll', 'nvngx_dlssg.dll',
                      'nvngx_dlss-notice.txt', 'dlssg-notice.txt', 'nvidia-rtx-sdks-license.txt',
                      'streamline-license.txt'}
@@ -57,6 +60,10 @@ def _files(game, minimal=False):
     missing = set(REQUIRED) - files.keys()
     if missing:
         raise ValueError('the game folder is incomplete. Missing ' + ', '.join(sorted(missing)))
+    graphics_tool = _collect(game, (GRAPHICS_TOOL,), ())
+    if not graphics_tool:
+        raise ValueError('select Rebuild the Game in the launcher to add the graphics tool, then export again')
+    files.update(graphics_tool)
     if minimal:
         return files
 
@@ -85,13 +92,41 @@ def _readme(game):
         'to Steam as a non-Steam game and enable Proton.\n'
         'Steam Frame: upload the extracted folder with the SteamOS Devkit Client,\n'
         'using Steam Play (Proton) for Windows and ocarina.exe as the launch command.\n\n'
+        'Before playing, run Prepare Graphics.exe on the destination PC to check its\n'
+        'Vulkan device and prepare shaders. On Wine use wine "Prepare Graphics.exe".\n'
+        'Pass --check-only for a quick compatibility check without shader preparation.\n'
+        'The full export can also rebuild recorded pipelines, including mesh draws.\n'
+        'New draw states may still need compilation during play.\n\n'
         + (f'CPU target: {cpu}.\n' if cpu else 'The CPU target is inherited from the installed build.\n')
         + 'The destination needs a compatible Vulkan 1.3 driver with\n'
-        'VK_EXT_external_memory_host and VK_EXT_depth_clip_control.\n'
+        'VK_EXT_external_memory_host, VK_EXT_depth_clip_control and VK_EXT_mesh_shader.\n'
         'Press F1 in the game to open settings, then choose Controls.\n\n'
         'This archive contains files derived from your own game. Keep it for\n'
         'personal use and do not publish or share it.\n'
     )
+
+
+def _write_shader_seeds(game, output, cancel):
+    # These are untranslated programs and default bind states. The destination GPU provides the translator's host options.
+    if cancel():
+        raise net.Cancelled()
+    cmd = [Layout().python_for_builds(), str(APP / 'tools/prepare_shaders.py'), str(output),
+           '--romfs', str(game / 'romfs'), '--exefs', str(game / 'exefs'), '--no-list', '--no-run', '--all-shaders']
+    log = output / 'shader-inventory.log'
+    with log.open('wb') as capture, subprocess.Popen(
+            cmd, stdout=capture, stderr=subprocess.STDOUT,
+            creationflags=build.CREATE_NO_WINDOW if os.name == 'nt' else 0) as proc:
+        while proc.poll() is None:
+            if cancel():
+                proc.kill()
+                raise net.Cancelled()
+            try:
+                proc.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                pass
+    if proc.returncode or any(not (output / name).is_file() for name in SHADER_SEEDS):
+        raise ValueError('could not read the shader inventory from the installed game. '
+                         + log.read_text(encoding='utf-8', errors='replace').strip()[-1200:])
 
 
 def export(game, out, *, minimal=False, progress=lambda done, total: None, cancel=lambda: False):
@@ -104,6 +139,14 @@ def export(game, out, *, minimal=False, progress=lambda done, total: None, cance
     if not minimal and _linked(game / 'nx2navi.ini'):
         raise ValueError('replace the nx2navi.ini link with a regular copy before exporting')
     files = _files(game, minimal=minimal)
+    with tempfile.TemporaryDirectory(dir=out.parent, prefix='.nx2navi-export-') as seed_dir:
+        seed_dir = Path(seed_dir)
+        _write_shader_seeds(game, seed_dir, cancel)
+        files.update({name: seed_dir / name for name in SHADER_SEEDS})
+        return _write_zip(game, out, files, minimal, progress, cancel)
+
+
+def _write_zip(game, out, files, minimal, progress, cancel):
     total = sum(p.stat().st_size for p in files.values())
     if shutil.disk_usage(out.parent).free < total:
         raise ValueError(f'the export needs at least {total / 1e9:.1f} GB of free space')
@@ -123,6 +166,8 @@ def export(game, out, *, minimal=False, progress=lambda done, total: None, cance
                     if cancel():
                         raise net.Cancelled()
                     info = zipfile.ZipInfo.from_file(path, name, strict_timestamps=False)
+                    if name in SHADER_SEEDS:
+                        info.compress_type = zipfile.ZIP_DEFLATED
                     with path.open('rb') as src, archive.open(info, 'w') as dst:
                         while chunk := src.read(CHUNK):
                             if cancel():

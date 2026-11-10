@@ -79,15 +79,22 @@ for updates); an XInput gamepad (d-pad or left stick, A, B, Y) while the window 
 ## Exporting the game
 
 Close the game, then select **Export Game** on the launcher's home screen. Choose **Yes** to include saves,
-settings and shader caches, or **No** for a game-only ZIP with default settings and a fresh profile. Shader
-caches are rebuilt during play when omitted. Then choose where to save the ZIP. The archive is for use on your own
-devices and contains files derived from your game.
+settings and shader caches, or **No** for a game-only ZIP with default settings and a fresh profile. Then choose
+where to save the ZIP. The archive is for use on your own devices and contains files derived from your game.
+If the launcher asks for a rebuild, select **Rebuild the Game** before exporting.
 
 Extract the whole archive with a ZIP64-capable tool such as 7-Zip. On Windows, open `ocarina.exe`. On Linux,
 run `wine ocarina.exe` from the extracted folder or add the executable to Steam as a non-Steam game and enable
 Proton. For Steam Frame, upload the extracted folder with the SteamOS Devkit Client and select Steam Play (Proton)
 for Windows. Use `ocarina.exe` as the launch command. The CPU target comes from the installed build, and the
-destination needs a compatible Vulkan 1.3 driver with `VK_EXT_external_memory_host` and `VK_EXT_depth_clip_control`.
+destination needs a compatible Vulkan 1.3 driver with `VK_EXT_external_memory_host`, `VK_EXT_depth_clip_control`
+and `VK_EXT_mesh_shader` with task and mesh shader support.
+
+Run **Prepare Graphics.exe** in the extracted folder before playing. It checks the selected Vulkan device and
+translates the included shader inventory for that machine. On Linux, use `wine "Prepare Graphics.exe"`.
+Pass `--check-only` to skip compilation. Both ZIPs include the untranslated shader inventory. The full ZIP can also
+rebuild recorded graphics pipelines, including mesh pipelines. Large compute shaders and new draw states can still
+compile during play.
 
 The command-line equivalent is
 `python -m launcher.cli export --game "C:\Games\Ocarina" --out "D:\Ocarina Portable.zip"`.

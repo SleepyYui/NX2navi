@@ -1,5 +1,4 @@
 """Portable game exports with synthetic game files."""
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -19,10 +18,10 @@ class GameExportTest(unittest.TestCase):
         self.game = self.root / 'installed'
         self.out = self.root / 'portable.zip'
         self.files = {
-            'ocarina.exe', 'SDL3.dll', 'libopus-0.dll', 'nx2navi_xlate.exe', 'nx2navi_xlate.id',
+            'ocarina.exe', 'Prepare Graphics.exe', 'SDL3.dll', 'libopus-0.dll', 'nx2navi_xlate.exe', 'nx2navi_xlate.id',
             'exefs/main.npdm', 'exefs/main', 'exefs/rtld', 'exefs/sdk', 'exefs/subsdk0',
             'romfs/romfs.bin', 'romfs-index.bin',
-            'romfs-patches-steamdeck/manifest.tsv', 'shader-cache/program.spv', 'shader-programs.bin',
+            'romfs-patches-steamdeck/manifest.tsv', 'shader-cache/program.spv', 'shader-programs.bin', 'pipeline-keys.bin',
             'nvngx_dlss.dll', 'nvngx_dlss-NOTICE.txt',
             'profile/account.uid', 'profile/save/user/slot1', 'profile/save-tx/ready-7/slot1',
         }
@@ -35,16 +34,31 @@ class GameExportTest(unittest.TestCase):
             path.write_bytes(name.encode())
         (self.game / 'nx2navi.ini').write_text(
             '[input]\nbind_a = key:default, pad:south\nROMFS = "D:\\original"\n', encoding='utf-8', newline='\n')
+        self.seeds = {'seed-programs.bin': b'programs from game files', 'seed-answers.bin': b'default answers'}
+
+        def census(game, output, cancel):
+            self.assertEqual(game, self.game)
+            for name, data in self.seeds.items():
+                (output / name).write_bytes(data)
+
+        seed_scan = patch('launcher.game_export._write_shader_seeds', census, create=True)
+        seed_scan.start()
+        self.addCleanup(seed_scan.stop)
+
+    def export_cli(self, *extra):
+        from launcher import cli
+
+        return cli.main(['--root', str(self.root / 'launcher'), 'export', '--game', str(self.game),
+                         '--out', str(self.out), *extra])
 
     def test_cli_exports_playable_files_without_source_paths_or_build_cache(self):
-        result = subprocess.run([sys.executable, '-m', 'launcher.cli', '--root', str(self.root / 'launcher'),
-                                 'export', '--game', str(self.game), '--out', str(self.out)],
-                                cwd=ROOT, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.export_cli(), 0)
         with zipfile.ZipFile(self.out) as archive:
-            self.assertEqual(set(archive.namelist()), self.files | {'README.txt', 'nx2navi.ini', 'profile/'})
+            self.assertEqual(set(archive.namelist()), self.files | self.seeds.keys() | {'README.txt', 'nx2navi.ini', 'profile/'})
             for name in self.files:
                 self.assertEqual(archive.read(name), name.encode())
+            for name, data in self.seeds.items():
+                self.assertEqual(archive.read(name), data)
             self.assertEqual(archive.read('nx2navi.ini'), b'[input]\nbind_a = key:default, pad:south\n')
             self.assertIn(b'wine ocarina.exe', archive.read('README.txt'))
 
@@ -58,15 +72,12 @@ class GameExportTest(unittest.TestCase):
         self.assertEqual(self.out.read_bytes(), b'previous export')
 
     def test_minimal_cli_export_omits_personal_data_and_shader_caches(self):
-        result = subprocess.run([sys.executable, '-m', 'launcher.cli', '--root', str(self.root / 'launcher'),
-                                 'export', '--game', str(self.game), '--out', str(self.out), '--minimal'],
-                                cwd=ROOT, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.export_cli('--minimal'), 0)
         with zipfile.ZipFile(self.out) as archive:
             omitted = {'shader-cache/program.spv', 'shader-programs.bin', 'romfs-patches-steamdeck/manifest.tsv',
-                       'nvngx_dlss.dll', 'nvngx_dlss-NOTICE.txt',
+                       'nvngx_dlss.dll', 'nvngx_dlss-NOTICE.txt', 'pipeline-keys.bin',
                        'profile/account.uid', 'profile/save/user/slot1', 'profile/save-tx/ready-7/slot1'}
-            self.assertEqual(set(archive.namelist()), self.files - omitted | {'README.txt', 'profile/'})
+            self.assertEqual(set(archive.namelist()), self.files - omitted | self.seeds.keys() | {'README.txt', 'profile/'})
 
     def test_large_members_use_zip64(self):
         from launcher import game_export
