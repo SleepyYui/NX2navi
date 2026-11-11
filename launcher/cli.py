@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import time
+import zipfile
 
 if __name__ == '__main__' and not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -63,6 +64,10 @@ def main(argv=None):
     p.add_argument('--game')
     p.add_argument('--out', required=True)
     p.add_argument('--minimal', action='store_true', help='omit saves, settings, shader caches and optional mods')
+    p = sub.add_parser('patch')
+    p.add_argument('--game')
+    p.add_argument('--base', required=True, help='the original full portable game ZIP')
+    p.add_argument('--out', required=True, help='the ZIP of changed files to create')
     p = sub.add_parser('fonts')
     p.add_argument('--dump', default='')
     p.add_argument('--game', default='')
@@ -71,6 +76,20 @@ def main(argv=None):
     a = ap.parse_args(argv)
     ctx = Context(Layout(root=a.root) if a.root else None, echo=False)
     s = ctx.settings
+
+    if a.cmd == 'patch':
+        from . import game_patch
+        gd = a.game or s.get('game_dir')
+        if not gd:
+            print('error: select the updated game with --game', file=sys.stderr)
+            return 1
+        try:
+            result = game_patch.create(gd, a.base, a.out)
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            print(f'error: {error}', file=sys.stderr)
+            return 1
+        print(f'Created {result["path"]}: {result["changed"]} changed files, {result["size"] / 1e6:.1f} MB')
+        return 0
 
     if a.cmd == 'check':
         job = jobs.CheckJob(ctx).run_inline()
@@ -103,7 +122,7 @@ def main(argv=None):
 
     if a.cmd == 'continue-update':
         gd = s.get('game_dir')
-        return follow(jobs.ContinueUpdateJob(ctx, gd if gd and build.built_version(gd) else '', a.old,
+        return follow(jobs.ContinueUpdateJob(ctx, gd if build.installed(gd) else '', a.old,
                                              s.get('dump')))
 
     if a.cmd == 'tools':

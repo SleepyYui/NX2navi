@@ -14,7 +14,7 @@ it. The code is `launcher/`, the release is made by `tools/make_launcher.py`, an
    drive, and proposes `<launcher>\game` as the install folder (or `X:\Games\NX2navi` on the drive with the most
    free space when that drive has less than 40 GB). Both rows can be changed.
 3. Selects **Begin Installation**. The launcher downloads the build tools (about 170 MB, once), checks the dump,
-   unpacks it, translates and compiles the game: 10 to 25 minutes. It keeps the PC awake meanwhile.
+   unpacks it, translates and compiles the game: 20 to 45 minutes. It keeps the PC awake meanwhile.
 4. Selects **Play**. The launcher hides while the game runs and comes back when it exits.
 
 From then on the launcher looks for a new version when it opens and every hour while it runs, also while it is
@@ -38,10 +38,19 @@ Customize Launcher (on the home screen) makes the look the player's own:
 - Color Scheme: Forest (the colours above), Volcano, Lake, Desert, Temple and Shadow. A scheme is the first one with
   its woods, accents, backdrop and glow turned to other hues (`art.THEMES`, `art.recolor`), so each keeps the same
   light and dark steps and the same readable text. The window is drawn again in the new colours at once. The names
-  are plain words, not the game's.
+  are plain words, not the game's. Custom, the last one, takes three colours of the player's: Background Color for
+  the backdrop, Panel Color for the list panel, the description box and the title band, and Button Color for the
+  rows' cells and the orange choices in them. Each opens a picker in the description
+  box's place: a square of the hue's colours (saturation across, brightness up and down) and a hue bar under it, to
+  click or drag on, Hue, Saturation and Brightness rows for the arrows and the gamepad, and Hex Code, where a code
+  such as `#3A7BD5` is typed. The picked colour stands in for one colour of the first scheme (`art.CUSTOM_SLOTS`) and
+  the rest of its part of the window follows it, lighter and darker as in the first scheme (`art.follow`); text on
+  a light button or panel turns dark. The window takes the new colour as the mouse moves; Reset brings back the first scheme's colour.
 - Background: a picture of the player's own behind the panels instead of the scheme's backdrop (`launcher/ui/picture.py`:
-  PNG, JPEG, WebP, BMP, GIF or TIFF, read with Pillow). It is cut to the window's shape around its middle and kept as
-  `data/background.npy`, so the launcher needs the file no more; Background Dimming darkens it (0 to 80 %) for the
+  PNG, JPEG, WebP, BMP, GIF or TIFF, read with Pillow). It fills the window below the title band, so none of it is
+  hidden under the band: cut to that shape around its middle and scaled evenly, never stretched, and kept as
+  `data/background.npy`, so the launcher needs the file no more (a copy an older launcher kept for the whole window is
+  made again from the file while it is there); Background Dimming darkens it (0 to 80 %) for the
   text over it, the list panel and the description box turn a little see-through, and Remove Background brings the
   scheme's backdrop back.
 - Animations (on by default): the cursor glides from row to row, a new screen slides into place, sparks drift up
@@ -55,7 +64,20 @@ Customize Launcher (on the home screen) makes the look the player's own:
   it is silent until the player's game has been read. Moving the cursor makes no sound. They are played from memory
   (PlaySound on Windows; `pw-play`, `paplay` or `aplay` elsewhere).
 
-The choices are `theme`, `background`, `background_dim`, `animations` and `sounds` in `data/launcher.json`.
+- Add to Steam (Windows): the game in the player's Steam library as *The Legend of Zelda Ocarina of Time*, started
+  from there without the launcher's window (`launcher/steam.py`). Its pictures are made from the player's game when
+  the row is selected (`launcher/gameart.py`): Navi as the game's HUD draws her for the icon, the title screen's logo,
+  and a frame of the first title movie (the moonlit field) as the background, the cover and the wide tile, the movie
+  decoded with the toolchain's `dav1d.exe` and the logo with the runtime's own ASTC decoder built with its clang. They
+  go into each signed-in account's `config/grid`, the shortcut into its `shortcuts.vdf` (other shortcuts kept as they
+  are, ours updated when it is there; the file before the first change kept as `shortcuts.vdf.nx2navi-backup`).
+  Steam reads that file only when it starts and writes it back when it closes, so a running Steam is asked to close
+  first and started again after. The shortcut runs the launcher's `pythonw.exe` on `data/steam_play.pyw`, which
+  starts the launcher of `app/current.txt` with `--play`: the game starts as Play starts it, and the process waits
+  for it, so Steam counts the game as running while it is.
+
+The choices are `theme`, `custom_background`, `custom_panel`, `custom_buttons`, `background`, `background_dim`,
+`animations` and `sounds` in `data/launcher.json`.
 
 Navi (`art.NAVI`, 22 x 21 pixels, drawn in whole pixels at every size) is also the icon of `NX2navi.exe`,
 `NX2navi-Setup.exe`, the window and its taskbar button (`art.navi_ico`, written into the release by
@@ -64,9 +86,10 @@ identity (`NX2navi.Launcher`), so the taskbar groups and pins it under NX2navi r
 
 Screens (`launcher/ui/app.py`): first run (dump, install folder, Desktop Shortcut, Check for Updates at Start,
 Update Channel, Begin Installation); the steps of an install, update or rebuild with their progress, the build log's
-  last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Saves, Export Game,
-Rebuild the Game, Customize Launcher, Settings); customize (Color Scheme, Background, with a picture set Background
-Dimming and Remove Background, Animations, Sounds, Back); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
+last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Saves, Export Game, Game Patcher,
+Rebuild the Game, Customize Launcher, Settings); customize (Color Scheme, with Custom Background Color, Panel Color and
+Button Color, Background, with a picture set Background Dimming and Remove Background, Animations, Sounds, Add to Steam on
+Windows, Back); the colour picker (Hue, Saturation, Brightness, Hex Code, Reset, Done); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
 Open Saves Folder, Back); settings (update check, Install Updates Automatically, Hide Launcher While Playing, Keep
 Build Cache, Update Channel, the folders, Open Logs Folder, Uninstall, Back); uninstall (keep or remove the built game).
 A screen with more rows than the window holds draws them closer together (`fit_rows`).
@@ -79,7 +102,8 @@ for updates); an XInput gamepad (d-pad or left stick, A, B, Y) while the window 
 ## Exporting the game
 
 Close the game, then select **Export Game** on the launcher's home screen. Choose **Yes** to include saves,
-settings and shader caches, or **No** for a game-only ZIP with default settings and a fresh profile. Then choose
+settings and shader caches, or **No** for a game-only ZIP with default settings, a fresh profile and Check Graphics.exe.
+The game-only ZIP excludes shader preparation files and caches. Then choose
 where to save the ZIP. The archive is for use on your own devices and contains files derived from your game.
 If the launcher asks for a rebuild, select **Rebuild the Game** before exporting.
 
@@ -87,18 +111,32 @@ Extract the whole archive with a ZIP64-capable tool such as 7-Zip. On Windows, o
 run `wine ocarina.exe` from the extracted folder or add the executable to Steam as a non-Steam game and enable
 Proton. For Steam Frame, upload the extracted folder with the SteamOS Devkit Client and select Steam Play (Proton)
 for Windows. Use `ocarina.exe` as the launch command. The CPU target comes from the installed build, and the
-destination needs a compatible Vulkan 1.3 driver with `VK_EXT_external_memory_host`, `VK_EXT_depth_clip_control`
-and `VK_EXT_mesh_shader` with task and mesh shader support.
+destination needs a compatible Vulkan 1.3 driver with `VK_EXT_external_memory_host` and `VK_EXT_depth_clip_control`.
+Cards without mesh shaders use the compute fallback (`mesh_fallback = auto`).
 
 Run **Prepare Graphics.exe** in the extracted folder before playing. It checks the selected Vulkan device and
 translates the included shader inventory for that machine. On Linux, use `wine "Prepare Graphics.exe"`.
-Pass `--check-only` to skip compilation. Both ZIPs include the untranslated shader inventory. The full ZIP can also
+Pass `--check-only` to skip compilation. The full ZIP includes the untranslated shader inventory and can also
 rebuild recorded graphics pipelines, including mesh pipelines. Large compute shaders and new draw states can still
 compile during play.
 
 The command-line equivalent is
 `python -m launcher.cli export --game "C:\Games\Ocarina" --out "D:\Ocarina Portable.zip"`.
 Add `--minimal` for a game-only ZIP.
+
+## Patching an exported game
+
+Open **Game Patcher** in the launcher, or **Game Patcher.exe** in the installed launcher folder. Select your original
+full game ZIP, the updated game folder, and the patch ZIP to create. The tool compares file contents with SHA-256
+and writes complete new and changed runtime files into a compressed ZIP. It includes neither saves nor settings
+nor shader caches. The original ZIP can be used again for a later cumulative patch.
+
+Close the game on the destination PC, then extract the patch over its game folder and replace files when asked.
+If a runtime file was removed, `PATCH-README.txt` names it for removal. `PATCH-MANIFEST.json` records the changed
+files and the hashes of obsolete files. A patch ZIP cannot be used as the full baseline for another comparison.
+
+The command-line equivalent is
+`python -m launcher.cli patch --game "C:\Games\Ocarina" --base "D:\Ocarina.zip" --out "D:\Ocarina Patch.zip"`.
 
 ## The launcher's folder
 
@@ -117,7 +155,7 @@ toolchain/msys64/ucrt64  MSYS2's clang and libraries, downloaded from the MSYS2 
 toolchain/pkgs/          the downloaded package files
 data/launcher.json       settings; data/logs/launcher.log (and crash.log); data/cache/fonts and data/cache/sounds
                          (the game's font and interface sounds, decoded from the player's game);
-                         data/background.npy (the player's background picture, fitted to the window)
+                         data/background.npy (the player's background picture, fitted below the title band)
 game/                    the built game, unless another folder was chosen (its layout: README-BuildKit.md), with
                          saves/ for saves to import and the backups imports make (below)
 ```
@@ -137,11 +175,17 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
    complete. No MSYS2 shell or pacman runs. Then zbic: the wheel for the bundled Python from PyPI, checked against
    PyPI's sha256, into `pydeps/`.
 2. **Inspect Your Game** to **Compile**: `tools/make_game.py --nup <dump> --out <game> --msys <toolchain> --events`,
-   whose `@@` progress lines drive the rows (check, exefs, romfs, lift, compile). How it keeps the build short:
+   whose `@@` progress lines drive the rows (check, exefs, romfs, lift, compile). Before the first long step it
+   looks at what can be known to fail later: the disk space of every step that will run (the RomFS image and 1 GiB,
+   2 GiB for the build cache, 4 GiB for the prepared shaders; `check_space` names each part and how much is
+   missing), and that the build tools compile and link an empty program (`probe_toolchain`). How it keeps the build
+   short:
    - The RomFS image (26 GB, mostly disk work) is packed beside the lift and the compile (processor work), so a first
      build takes about as long as the longer of the two. Only `romfs.c`, which includes the RomFS index's
      `romfs_config.h`, waits for the image.
-   - Every logical processor compiles, the largest files first, so no big file starts last and runs on alone.
+   - Every logical processor compiles, the largest files first, so no big file starts last and runs on alone; fewer
+     compiles run when memory is short, as many as 80 % of the free memory holds at 768 MiB each (`make_game.py`
+     `default_jobs`).
    - The lifted code compiles with MSYS2 CLANG64's clang when the toolchain has it: the same LLVM release as
      UCRT64's, built with profile-guided optimisation, about a fifth faster on this code and writing the same objects
      (it reads UCRT64's headers; `make_game.py` `fast_clang` checks that both report the same version and target).
@@ -160,14 +204,20 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
    and writes the Xbox, PlayStation, Steam Deck and keyboard and mouse prompts into `romfs-patches-*` beside the game (about
    30 s), which the game's Controls > Button prompts loads. The keyboard and mouse prompts show the keys of
    `nx2navi.ini`'s `bind_` lines, so Rebuild the Game after rebinding keys draws them again; the step's key names
-   all it reads (the RomFS, the art, the tools, those lines), so it runs again only when one changed or a folder is
-   gone, and runs no other step again. Without art the row is not shown and the game keeps its own prompts.
+   all it reads (the RomFS, the art, those lines) and the version of the tools (`make_game.py` `PROMPT_TOOLS`, changed
+   by hand when a change to them changes what they write: an edit of a script alone does not draw the prompts
+   again), so it runs again only when one changed or a folder is gone, and runs no other step again. Without art
+   the row is not shown and the game keeps its own prompts.
 5. **Check the Game Files**: make_game.py's last step runs `tools/romfs_check.py`, once for each copy of the game data
-   (about 4 minutes, in worker threads, never while the game runs). It decompresses every file, writes
+   (about 4 minutes on players' PCs up to 0.7.1, in worker threads, never while the game runs; its key holds the
+   check's version, `SCAN_TOOL`, in the same way). It decompresses every file, writes
    `romfs-check.json` beside the game, and for each damaged texture puts a stand-in, another texture of the same kind
    under the damaged one's name, in `mods/Damaged file stand-ins`, so the game can load what needs it. A damaged file
    of any other kind is only reported: only a clean dump restores it. In play the game logs a file it keeps opening
-   and cannot load (runtime/romfs.c `open_note`).
+   and cannot load (runtime/romfs.c `open_note`). The launcher shows what the check found (`jobs.Job.note_scan`):
+   the count in the step's row ("4 Flagged, 3 Stand-Ins"), and after a job in which the check ran a sentence on the
+   home screen and in `launcher.log`. The four files the check flags on every copy of the game (`jobs.SCAN_EXPECTED`)
+   are told as that, with nothing for the player to do; other files are counted and `romfs-check.json` named.
 6. The game's Cetra Display is decoded for the window.
 
 ## Updating
@@ -180,6 +230,10 @@ repository for testing; `{"type": "url", "url": ".../NX2navi-update.json"}` in f
 directly. Every address is https (plain http only to this PC), a redirect to http is refused, and the token is not
 sent on when a redirect leaves the host it was meant for (`launcher/net.py`). A manifest that does not give a file's
 size and sha256 is refused.
+
+GitHub allows an address 60 such requests an hour. The Updates row and F5 therefore start no check within a minute
+of the last one (`FORCED_CHECK_PAUSE`), and a check GitHub refuses says when the allowance is whole again, from the
+answer's `X-RateLimit-Reset` (`feed.retry_text`). A failed check is one line in `launcher.log`.
 
 ### In the background
 
@@ -252,18 +306,33 @@ The stub swaps `python.next` in while no Python runs, then starts the new versio
      objects of 0.5.0 and earlier); Rebuild the Game compiles it for this processor's (`--retune`), and runs the
      compile step for that even when nothing else changed (`retune_due`).
 6. **Swap In the New Build**: lld links `ocarina.exe.new`, which replaces `ocarina.exe` only once it is complete. A
-   failed rebuild leaves the old build playable; Rebuild the Game tries again.
+   failed rebuild leaves the old build playable; Rebuild the Game tries again. A rebuild that lifted again and then
+   stopped has no finished compile on record (`build.built_version` is empty), but the old exe and the unpacked game
+   files are there: the launcher still counts the game as installed (`build.installed`), opens on home, where
+   Rebuild the Game reads "Not Finished", and never asks for the dump again. Begin Installation into a folder whose
+   game files are already unpacked builds on from them as well (`jobs.InstallJob.args`).
 7. **Prepare the Shaders** is skipped once shaders were prepared before (`shader-prepared.bin`): the game keeps using
    them and translates them again with the new translator in the background (`NX2NAVI_SHADER_CARRY`). With
-   `shader_carry = 0`, or nothing prepared yet, the step prepares them all as at the install.
+   `shader_carry = 0`, or nothing prepared yet, the step prepares them all as at the install. So it does when the
+   list was prepared from another shader seed than the one this kit writes: `shader-prepared.bin` carries the digests
+   of the two seed files and the translator identity (`runtime/prp_file.h`), the step writes the seed first
+   (`prepare_shaders.py --no-run`, seconds) and compares (`make_game.py` `seed_changed`); a list from before it
+   recorded its seed is prepared again once. Another translator alone does not prepare again. The step still builds
+   the prepared shaders into the graphics driver's cache again (`make_game.py` `warm_driver_cache`): seconds while
+   the driver has them, 20 minutes on a player's PC when the update changed what they are built with. Its bar
+   follows that count from 0 to 100 %, and the Updates row says an update takes from a few minutes to half an hour
+   or more (`launcher/ui/app.py` `UPDATE_TAKES`).
 8. **Draw the Button Prompts**, with button art in the new version: only when the art, the prompt tools or the key
    bindings changed, or a prompt folder is missing (a first version with art draws them all).
 9. Every version but the current and the previous one is deleted, except a staged release newer than the current
    one.
 
 When the new version fails to start (exit code 86 from `start.pyw`, or any error within six seconds), the stub sets
-`current.txt` back to `previous.txt`'s version and starts it with `--rolled-back`. The game is never rebuilt while it
-runs. Keep Build Cache off deletes the lifted C and the objects (about 5 GB) after each build but keeps
+`current.txt` back to `previous.txt`'s version and starts it with `--rolled-back`. `start.pyw` writes the failure to
+`data/logs/crash.log` and shows it in a message box only when there is no version to go back to, when Steam started
+it, or when the six seconds are over (`quiet_exit`): a box holds the exit code back until it is closed, and the
+broken version then stayed the current one. The game is never rebuilt while it
+runs. Keep Build Cache off deletes the lifted C and the objects (about 1.5 GB) after each build but keeps
 `build-cache/state.json`, so updates still rebuild without the dump (compiling everything).
 
 ## Sharing a save
@@ -274,7 +343,9 @@ save. Saves (home, under Game Folder; `launcher/saves.py`) and the Saves rows of
 
 **Export.** Export Save writes `NX2navi-save-<date>_<time>.zip` into the Downloads folder (Export To chooses another
 folder) and opens the folder with the zip selected, ready to drag into a bug report. With Add Log and Settings on (the
-default) it is `...-bug-report.zip` and also holds the game's latest log and its `nx2navi.ini`. In the game, Export
+default) it is `...-bug-report.zip` and also holds the game's latest log and its `nx2navi.ini`; while the game has no
+save yet (it stopped before its first one) the launcher then writes `NX2navi-log-<date>_<time>-bug-report.zip` with
+those two alone, which an import refuses as a zip without a save. In the game, Export
 save and Export save for a bug report write the same two zips into Downloads; the second holds the log of the run in
 progress. The zip:
 
@@ -358,6 +429,9 @@ game folder is the default `<launcher>\game`. The dump is never touched.
    ```
 
    `--ffx` puts AMD's signed `amd_fidelityfx_vk.dll` (FidelityFX SDK 1.1.4) in the release for FSR 3.1.
+   `--ffx4 <folder>` puts AMD's signed `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` (FSR SDK
+   2.4.0, the files of its `Kits/FidelityFX/signedbin/`) in the release for FSR 4; without it the menu offers no FSR 4.
+   `amd_fidelityfx_framegeneration_vk.dll` goes along when it is in that folder (`fsr4_fg`).
    NVIDIA's `nvngx_dlss.dll` goes in by itself: the script downloads the version `tools/dlss_pin.py` pins from
    NVIDIA's DLSS SDK repository (cached in `toolchain/launcher-dl/`), checks its size and sha256, and puts it in
    `bin/` with `nvngx_dlss-NOTICE.txt`; `make_game.py` copies both beside the game. `--dlss FILE` takes a copy on disk
@@ -402,7 +476,8 @@ pruning, unsafe archives, the background update (a release staged beside the run
 `staged.json` marker, a staged release installed after a restart, no install while the game runs, the install once
 it exited, nothing by itself with Install Updates Automatically off, a failed staging tried again after the next
 check), the font decoding on a system font wrapped like the game's, the look (every colour scheme complete, the
-background picture cut to the window's shape and kept, the sound effects as WAVs and low by default), `make_game.py`
+Custom scheme's picked colours, colour square and typed hex code, the background picture cut to the shape below the
+title band and kept, never stretched, the sound effects as WAVs and low by default), `make_game.py`
 on a synthetic
 `.nup` (events, skipped steps, `--rebuild` without the dump, step keys, the shaders key following the translator the
 build uses), the RomFS step beside the lift and compile
@@ -417,9 +492,23 @@ refuses: no manifest, another format or game, a newer format, paths outside the 
 job with a fake
 `make_game.py` (with and without the prompts row), and the window's selftest when a display is there.
 
+What goes wrong around a build is tested the same way, on made-up folders and stand-in processes: an update that
+stops in its compile (the game stays installed, home says how to finish, the install goes on from the unpacked
+files), `start.pyw` on a version that cannot be imported (exit code 86 at once, no message box, with a version to go
+back to), a cut RomFS image and the free space, the object cache written while the compile runs and kept when it is
+cut, a RomFS step that does not repeat the lift, the update's duration text and the warm-up's bar, a damaged dump
+named by its file and an unexpected error by its message, the file check's result in its row and on home, the
+game's FATAL line after exit codes 70 and 71, the job count by free memory and the build's priority class, a line
+handler that raises and a log that cannot be written, one forced update check a minute and GitHub's reset time, a
+game folder with characters outside the Basic Multilingual Plane (its `modules.c` compiled when a C compiler is
+there), the file check at both piece sizes against the check as it was, the disk space of every step and the build
+tools' test compile, and the prompt tool's unpacking. Two tests record the logic of `tools/romfs_check.py` and of
+the three prompt scripts (their code without comments and docstrings) beside `SCAN_TOOL` and `PROMPT_TOOLS`: they
+fail when that logic changes, to ask whether the step must run again on every install.
+
 ## Requirements and limits
 
-- Windows 10 or 11, x86-64; the build's own requirements (README-BuildKit.md): 16 GB of RAM, about 30 GB free for
+- Windows 10 or 11, x86-64; the build's own requirements (README-BuildKit.md): 16 GB of RAM, about 34 GB free for
   the game and 1.5 GB for the launcher and its tools, a Vulkan 1.3 GPU.
 - The programs are not signed: SmartScreen warns on the first start of the setup.
 - English only for now.

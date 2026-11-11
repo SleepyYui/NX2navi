@@ -14,8 +14,10 @@ REQUIRED = ('ocarina.exe', 'SDL3.dll', 'libopus-0.dll', 'nx2navi_xlate.exe', 'ro
             'exefs/main.npdm', 'exefs/main', 'exefs/rtld', 'exefs/sdk', 'exefs/subsdk0')
 CACHE_FILES = ('shader-answers.bin', 'shader-programs.bin', 'shader-prepared.bin', 'compute-used.bin', 'pipeline-keys.bin')
 GRAPHICS_TOOL = 'Prepare Graphics.exe'
+CHECK_TOOL = 'Check Graphics.exe'
 SHADER_SEEDS = ('seed-programs.bin', 'seed-answers.bin')
 OPTIONAL_GRAPHICS = {'amd_fidelityfx_vk.dll', 'nvngx_dlss.dll', 'nx2navi_dlssg.dll', 'nvngx_dlssg.dll',
+                     'amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll', 'amd_fidelityfx_framegeneration_vk.dll',
                      'nvngx_dlss-notice.txt', 'dlssg-notice.txt', 'nvidia-rtx-sdks-license.txt',
                      'streamline-license.txt'}
 CHUNK = 8 * 1024 * 1024
@@ -60,8 +62,9 @@ def _files(game, minimal=False):
     missing = set(REQUIRED) - files.keys()
     if missing:
         raise ValueError('the game folder is incomplete. Missing ' + ', '.join(sorted(missing)))
-    graphics_tool = _collect(game, (GRAPHICS_TOOL,), ())
-    if not graphics_tool:
+    tools = (CHECK_TOOL,) if minimal else (GRAPHICS_TOOL, CHECK_TOOL)
+    graphics_tool = _collect(game, tools, ())
+    if set(tools) - graphics_tool.keys():
         raise ValueError('select Rebuild the Game in the launcher to add the graphics tool, then export again')
     files.update(graphics_tool)
     if minimal:
@@ -77,7 +80,7 @@ def _files(game, minimal=False):
     return files
 
 
-def _readme(game):
+def _readme(game, minimal=False):
     try:
         level = json.loads((game / 'build-cache/obj/lifted-build.json').read_text(encoding='utf-8'))['level']
     except (OSError, ValueError, KeyError, TypeError):
@@ -92,14 +95,17 @@ def _readme(game):
         'to Steam as a non-Steam game and enable Proton.\n'
         'Steam Frame: upload the extracted folder with the SteamOS Devkit Client,\n'
         'using Steam Play (Proton) for Windows and ocarina.exe as the launch command.\n\n'
-        'Before playing, run Prepare Graphics.exe on the destination PC to check its\n'
-        'Vulkan device and prepare shaders. On Wine use wine "Prepare Graphics.exe".\n'
-        'Pass --check-only for a quick compatibility check without shader preparation.\n'
-        'The full export can also rebuild recorded pipelines, including mesh draws.\n'
-        'New draw states may still need compilation during play.\n\n'
+        + ('Open Check Graphics.exe to check compatibility on the destination PC.\n'
+           'On Wine use wine "Check Graphics.exe". Shaders are prepared during play.\n\n' if minimal else
+           'Open Prepare Graphics.exe on the destination PC to check compatibility\n'
+           'and prepare shaders. On Wine use wine "Prepare Graphics.exe".\n'
+           'Check Graphics.exe performs just the compatibility check.\n'
+           'Recorded pipelines can be rebuilt ahead of play. New draw states may\n'
+           'still need compilation during play.\n\n')
         + (f'CPU target: {cpu}.\n' if cpu else 'The CPU target is inherited from the installed build.\n')
         + 'The destination needs a compatible Vulkan 1.3 driver with\n'
-        'VK_EXT_external_memory_host, VK_EXT_depth_clip_control and VK_EXT_mesh_shader.\n'
+        'VK_EXT_external_memory_host and VK_EXT_depth_clip_control. Cards without\n'
+        'mesh shaders use the compute fallback (mesh_fallback = auto).\n'
         'Press F1 in the game to open settings, then choose Controls.\n\n'
         'This archive contains files derived from your own game. Keep it for\n'
         'personal use and do not publish or share it.\n'
@@ -139,6 +145,8 @@ def export(game, out, *, minimal=False, progress=lambda done, total: None, cance
     if not minimal and _linked(game / 'nx2navi.ini'):
         raise ValueError('replace the nx2navi.ini link with a regular copy before exporting')
     files = _files(game, minimal=minimal)
+    if minimal:
+        return _write_zip(game, out, files, minimal, progress, cancel)
     with tempfile.TemporaryDirectory(dir=out.parent, prefix='.nx2navi-export-') as seed_dir:
         seed_dir = Path(seed_dir)
         _write_shader_seeds(game, seed_dir, cancel)
@@ -158,7 +166,7 @@ def _write_zip(game, out, files, minimal, progress, cancel):
         with tempfile.NamedTemporaryFile(dir=out.parent, prefix=out.name + '.', suffix='.part', delete=False) as f:
             tmp = Path(f.name)
             with zipfile.ZipFile(f, 'w') as archive:
-                archive.writestr('README.txt', _readme(game))
+                archive.writestr('README.txt', _readme(game, minimal))
                 archive.mkdir('profile')
                 if ini:
                     archive.writestr('nx2navi.ini', ini.encode('utf-8', 'surrogateescape'))

@@ -435,7 +435,8 @@ static void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessF
 // So each is kept to half a VMA block (vk_vma_block_size's default 64 MiB), where VMA still places it in a block, not in
 // memory of its own: 16 MiB of texels, their blocks and BC3 fit in 32 MiB.
 #define CHUNK_OUT (16ull << 20)
-#define SCRATCH_MIN (32ull << 20)   // the shared scratch's least size: one chunk's texels plus its blocks and BC3
+#define SCRATCH_MIN (32ull << 20)   // the shared scratch's usual least size: one chunk's texels plus its blocks and BC3
+                                    // (smaller only after the device ran out of memory: scratch_get's second try)
 
 // The shared scratch and the command buffer it was last recorded into. An upload batch's command buffer is used again
 // only after that batch completed (vk_memory.c: completed batches go to the spare list), so the same handle means the
@@ -465,7 +466,12 @@ static int scratch_keep(void) {
 
 // A scratch of at least need bytes for recording into cb; *reused: earlier work (in cb, or with the keep rule in an
 // earlier batch) may still use it. 0 on failure.
+// A test's hook (vk.h): the next n requests for the scratch buffer fail, as when the video memory is used up.
+static volatile int32_t scratch_fail_n;
+void vk_astc_scratch_fail(int n) { plat_xchg32(&scratch_fail_n, n); }
+
 static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int *reused) {
+    if (plat_cas32(&scratch_fail_n, 0, 0) > 0 && plat_add32(&scratch_fail_n, -1) >= 0) return VK_NULL_HANDLE;
     int keep = scratch_keep();
     plat_mutex_lock(&g_lock);
     uint64_t now = kern_now_ns();
@@ -483,13 +489,19 @@ static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int
         VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VkBuffer b;
         VmaAllocation a;
-        if (vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, NULL) != VK_SUCCESS) {
+        VkResult r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, NULL);
+        if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && bi.size > need) {
+            // The usual scratch leaves room for later textures. This upload can still fit without the spare bytes.
+            bi.size = need;
+            r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, NULL);
+        }
+        if (r != VK_SUCCESS) {
             plat_mutex_unlock(&g_lock);
             return VK_NULL_HANDLE;
         }
         // the old one may still be read by its command buffer: freed once the batches recorded so far completed
         if (S.buf && S.dev == c->device) vk_defer_buffer(S.buf, S.alloc);
-        S.buf = b, S.alloc = a, S.size = size, S.dev = c->device;
+        S.buf = b, S.alloc = a, S.size = bi.size, S.dev = c->device;
         n_scratch_new++;
         vk_texstat_time(VK_TS_SCRATCH, t0);
     } else {
@@ -566,9 +578,9 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     VkBuffer sb = scratch_get(c, cb, cap_in + cap_out + cap_bc, &reused);
     if (!sb) {
         if (plat_inc32(&n_fail) <= 16)
-            rt_log("vk: ASTC scratch buffer of %llu bytes failed: texture left undecoded",
+            rt_log("vk: ASTC scratch buffer of %llu bytes failed: texture left undecoded for now",
                    (unsigned long long)(cap_in + cap_out + cap_bc));
-        return 0;
+        return -1;   // no memory at this moment: the caller tries again later (vk_texture.c upload)
     }
     plat_mutex_lock(&g_lock);
     int need_tab = !G.tab_uploaded;

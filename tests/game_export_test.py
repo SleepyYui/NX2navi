@@ -18,7 +18,7 @@ class GameExportTest(unittest.TestCase):
         self.game = self.root / 'installed'
         self.out = self.root / 'portable.zip'
         self.files = {
-            'ocarina.exe', 'Prepare Graphics.exe', 'SDL3.dll', 'libopus-0.dll', 'nx2navi_xlate.exe', 'nx2navi_xlate.id',
+            'ocarina.exe', 'Prepare Graphics.exe', 'Check Graphics.exe', 'SDL3.dll', 'libopus-0.dll', 'nx2navi_xlate.exe', 'nx2navi_xlate.id',
             'exefs/main.npdm', 'exefs/main', 'exefs/rtld', 'exefs/sdk', 'exefs/subsdk0',
             'romfs/romfs.bin', 'romfs-index.bin',
             'romfs-patches-steamdeck/manifest.tsv', 'shader-cache/program.spv', 'shader-programs.bin', 'pipeline-keys.bin',
@@ -75,9 +75,9 @@ class GameExportTest(unittest.TestCase):
         self.assertEqual(self.export_cli('--minimal'), 0)
         with zipfile.ZipFile(self.out) as archive:
             omitted = {'shader-cache/program.spv', 'shader-programs.bin', 'romfs-patches-steamdeck/manifest.tsv',
-                       'nvngx_dlss.dll', 'nvngx_dlss-NOTICE.txt', 'pipeline-keys.bin',
+                       'nvngx_dlss.dll', 'nvngx_dlss-NOTICE.txt', 'pipeline-keys.bin', 'Prepare Graphics.exe',
                        'profile/account.uid', 'profile/save/user/slot1', 'profile/save-tx/ready-7/slot1'}
-            self.assertEqual(set(archive.namelist()), self.files - omitted | self.seeds.keys() | {'README.txt', 'profile/'})
+            self.assertEqual(set(archive.namelist()), self.files - omitted | {'README.txt', 'profile/'})
 
     def test_large_members_use_zip64(self):
         from launcher import game_export

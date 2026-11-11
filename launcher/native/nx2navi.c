@@ -13,6 +13,7 @@
 
 #define STARTUP_FAILED 86
 #define QUICK_MS 6000
+static int game_patcher;
 
 static void message(const wchar_t *text)
 {
@@ -47,7 +48,8 @@ static long start_release(const wchar_t *root, const wchar_t *ver, const wchar_t
         message(L"The launcher's Python is missing. Run NX2navi-Setup.exe again to repair the installation.");
         return 1;
     }
-    swprintf(cmd, 32768, L"\"%ls\" \"%ls\\app\\%ls\\launcher\\start.pyw\" %ls %ls", python, root, ver, args, extra);
+    swprintf(cmd, 32768, L"\"%ls\" \"%ls\\app\\%ls\\launcher\\start.pyw\" %ls %ls %ls", python, root, ver, args, extra,
+             game_patcher ? L"--game-patcher" : L"");
     SetEnvironmentVariableW(L"NX2NAVI_LAUNCHER_ROOT", root);
     STARTUPINFOW si = {.cb = sizeof si};
     PROCESS_INFORMATION pi;
@@ -82,6 +84,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
     wchar_t root[PATHN], file[PATHN], ver[128], prev[128], extra[160];
     (void)instance; (void)previous; (void)show;
     exe_dir(root, PATHN);
+    wchar_t own_path[PATHN];
+    if (GetModuleFileNameW(NULL, own_path, PATHN)) {
+        wchar_t *own_name = wcsrchr(own_path, L'\\');
+        game_patcher = own_name && !_wcsicmp(own_name + 1, L"Game Patcher.exe");
+    }
     if (!root[0]) return 1;
     int argc = 0;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);

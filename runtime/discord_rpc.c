@@ -1,4 +1,4 @@
-// Discord Rich Presence: "Playing NX2navi" with the elapsed play time in the player's Discord status, through
+// Discord Rich Presence: the game name and artwork in the player's Discord status, through
 // the local IPC of a running Discord client (platform.h's plat_ipc_*). Nothing leaves the machine but the activity
 // itself, and nothing is sent while NX2NAVI_DISCORD_RPC is off (it is on by default, and does nothing without a
 // Discord client running on the same PC). NX2NAVI_DISCORD_APP_ID names the application whose name ("Playing <name>")
@@ -32,11 +32,11 @@
 enum { OP_HANDSHAKE = 0, OP_FRAME = 1, OP_CLOSE = 2, OP_PING = 3, OP_PONG = 4 };
 
 #define APP_ID_CAP 24    // a Discord snowflake: at most 20 digits
-#define IMAGE_KEY_CAP 64
+#define IMAGE_KEY_CAP 512
 #define ANSWER_CAP 8192  // the Ready frame carries the client's config; a few KiB
 
-// A settings value that fits the JSON below without escaping: the app id is digits, an asset key letters, digits,
-// '_' and '-' (what Discord's developer portal accepts for an asset key).
+// Settings values that fit the JSON below without escaping: a numeric application id, and an image asset key or
+// an HTTPS image URL.
 static int valid_app_id(const char *s) {
     size_t n = strlen(s);
     if (!n || n > 20) return 0;
@@ -48,6 +48,11 @@ static int valid_app_id(const char *s) {
 static int valid_image_key(const char *s) {
     size_t n = strlen(s);
     if (!n || n >= IMAGE_KEY_CAP) return 0;
+    if (!strncmp(s, "https://", 8)) {
+        for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+            if (*p <= 32 || *p >= 127 || *p == '"' || *p == '\\') return 0;
+        return 1;
+    }
     for (const char *p = s; *p; p++)
         if ((*p < 'a' || *p > 'z') && (*p < 'A' || *p > 'Z') && (*p < '0' || *p > '9') && *p != '_' && *p != '-')
             return 0;
@@ -166,22 +171,15 @@ static uint32_t next_nonce(void) {
     return (uint32_t)plat_inc32(&n);
 }
 
-// The activity as one SET_ACTIVITY frame: the game update and the port version as the details line ("Game 1.1.1 ·
-// Recomp 0.3.7": the port version without its +commit suffix, the art's hover text keeps the full one; the dot goes
-// as a JSON escape), the process's start as the timestamp Discord counts the elapsed time from, and the application's
-// art asset. 1 when the client answered (a slow answer that ran out of the 2 s read is fine: the next drain takes
-// it), 0 when the connection broke.
+// The activity carries the game name and image. 1 when the client answered (a slow answer that ran out of the
+// 2 s read is fine: the next drain takes it), 0 when the connection broke.
 static int send_activity(PlatIpc *p, const char *image) {
-    char json[512];
-    int v = rt_game_version;
-    uint64_t start = (plat_unix_time_ns() - plat_process_uptime_ns()) / 1000000000ull;
-    int port_len = (int)strcspn(rt_port_version, "+");
+    char json[1024];
     snprintf(json, sizeof json,
-             "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"%u\",\"args\":{\"pid\":%lu,\"activity\":{\"details\":\"Game "
-             "%d.%d.%d \\u00b7 Recomp %.*s\",\"timestamps\":{\"start\":%llu},\"assets\":{\"large_image\":\"%s\","
-             "\"large_text\":\"NX2navi %s\"}}}}",
-             next_nonce(), (unsigned long)plat_process_id(), v / 100, v / 10 % 10, v % 10, port_len, rt_port_version,
-             (unsigned long long)start, image, rt_port_version);
+             "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"%u\",\"args\":{\"pid\":%lu,\"activity\":{"
+             "\"name\":\"The Legend of Zelda: Ocarina of Time\",\"type\":0,\"assets\":{\"large_image\":\"%s\","
+             "\"large_text\":\"The Legend of Zelda: Ocarina of Time\"}}}}",
+             next_nonce(), (unsigned long)plat_process_id(), image);
     if (!write_frame(p, OP_FRAME, json)) return 0;
     uint32_t op = 0;
     char answer[ANSWER_CAP];

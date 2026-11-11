@@ -61,6 +61,9 @@ int wmain(int argc, wchar_t **argv) {
         fputs("Usage: Prepare Graphics.exe [--check-only]\n", stderr);
         return 2;
     }
+#ifdef CHECK_ONLY
+    check_only = 1;
+#endif
     DWORD result = run_game(check_only), processes[2];
     if (argc == 1 && _isatty(_fileno(stdin)) && GetConsoleProcessList(processes, ARRAYSIZE(processes)) == 1) {
         fputs("\nPress Enter to close.\n", stdout);

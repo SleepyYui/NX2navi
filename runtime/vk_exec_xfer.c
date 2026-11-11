@@ -82,8 +82,19 @@ static void note_gpu_write(VkExec *ex, uint64_t addr, uint64_t size) {
 
 typedef struct { volatile uint32_t *val; uint32_t mode, value; } EventWrite;
 
+// The side effects below that ran after a waiter on the executed timeline had gone on (vk_sync.c vk_sync_effect_late):
+// the game was already past the wait after its submit when these reached its memory.
+static volatile uint64_t late_events, late_counters, late_counts;
+
+void vk_exec_late_stats(uint64_t *events, uint64_t *counters, uint64_t *counts) {
+    *events = __atomic_exchange_n(&late_events, 0, __ATOMIC_RELAXED);
+    *counters = __atomic_exchange_n(&late_counters, 0, __ATOMIC_RELAXED);
+    *counts = __atomic_exchange_n(&late_counts, 0, __ATOMIC_RELAXED);
+}
+
 static void event_cb(void *arg) {
     EventWrite *e = arg;
+    if (vk_sync_effect_late()) __atomic_fetch_add(&late_events, 1, __ATOMIC_RELAXED);
     if (e->mode == NVN_EVENT_SIGNAL_MODE_ADD) __atomic_fetch_add(e->val, e->value, __ATOMIC_RELEASE);
     else __atomic_store_n(e->val, e->value, __ATOMIC_RELEASE);
     free(e);
@@ -104,6 +115,7 @@ typedef struct { uint64_t addr, seq; } CounterWrite;
 
 static void counter_cb(void *arg) {
     CounterWrite *w = arg;
+    if (vk_sync_effect_late()) __atomic_fetch_add(&late_counters, 1, __ATOMIC_RELAXED);
     write_counter(w->addr, 0);
     pending_written(w->addr, w->seq);
     free(w);
@@ -265,44 +277,113 @@ void vk_exec_oq_draw(VkExec *ex) {
 
 void vk_exec_oq_pass_end(VkExec *ex) { oq_close(ex); }
 
+static void oq_batch_drop(void);   // the results kept by the completion thread (oq_take)
+
 void vk_exec_xfer_shutdown(void) {
     if (oq_state > 0) vkDestroyQueryPool(vk_ctx()->device, oq_pool, NULL);
     oq_pool = VK_NULL_HANDLE, oq_state = 0, oq_next = 0, oq_counting = oq_reported = oq_keep = 0, oq_open = -1;
     oq_nseg = 0, oq_lost = 0, oq_count = 0;
     memset((void *)oq_busy, 0, sizeof oq_busy);
+    oq_batch_drop();
+}
+
+// The completion thread reads the results in batches (NX2NAVI_OQ_BATCH, default 1; 0: every segment by itself, as
+// before). The game tests one proxy per report, so a segment holds one query, and a frame of Hyrule Field has about a
+// hundred of them: one vkGetQueryPoolResults and one vkResetQueryPool each. On an RX 7900 XT (26.10.1) each of those
+// calls goes into the kernel, and the two hundred took 3.9 ms of every frame on the completion thread, which runs a
+// submission's callbacks before it lets the submission's waiters go: the game's main thread waits for the previous
+// frame's fence before it lets the next frame's GPU work start, so the frame after one replayed inside its submit
+// call began 4 to 6 ms late with every thread idle. Slots come from the ring in order, so the slots of the segments
+// that follow lie behind the one asked for: one call reads OQ_BATCH slots from there on with their availability, the
+// available ones are kept (the results stay in the pool until the reset), and the segments after it take theirs from
+// what is kept. A slot not available in the batch (its part had not run yet) is read again when its segment comes.
+// The slots taken are reset in runs, one vkResetQueryPool for each: a run ends when a slot that does not continue it
+// is taken or a new batch is read. Until then its slots stay busy for the replay, at most OQ_BATCH of the ring's
+// OQ_N, also while the game reports nothing.
+#define OQ_BATCH 256
+static struct {
+    uint32_t first, n;               // the slots kept: [first, first + n)
+    uint64_t v[OQ_BATCH * 2];        // per slot: samples, available
+    uint8_t taken[OQ_BATCH];
+    uint32_t r0, rn;                 // the run of taken slots still to be reset
+    uint64_t calls, slots, segs;     // since the last perf line: result calls, slots they read, segments served
+} OQB;
+static int oq_batch_mode = -1;
+
+static void oq_batch_drop(void) { OQB.n = OQB.rn = 0; }
+
+static void oq_reset_flush(VkDevice dev) {
+    if (!OQB.rn) return;
+    vkResetQueryPool(dev, oq_pool, OQB.r0, OQB.rn);
+    for (uint32_t k = 0; k < OQB.rn; k++) __atomic_store_n(&oq_busy[OQB.r0 + k], 0, __ATOMIC_RELEASE);
+    OQB.rn = 0;
+}
+
+static void oq_read(VkDevice dev, uint32_t first, uint32_t n) {
+    VkResult r = vkGetQueryPoolResults(dev, oq_pool, first, n, sizeof OQB.v[0] * 2 * n, OQB.v, 2 * sizeof OQB.v[0],
+                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (r != VK_SUCCESS && r != VK_NOT_READY) {
+        vk_device_lost_check(r, "the read of occlusion query results");
+        rt_fatal("vk: occlusion query results failed (%d)", (int)r);
+    }
+    OQB.first = first, OQB.n = n;
+    memset(OQB.taken, 0, n);
+    OQB.calls++, OQB.slots += n;
+}
+
+// The samples of slot q, whose submission has completed; *avail 0 when the query has no result.
+static uint64_t oq_take(VkDevice dev, uint32_t q, int *avail) {
+    uint32_t k = q - OQB.first;
+    if (!(q >= OQB.first && k < OQB.n && !OQB.taken[k] && OQB.v[2 * k + 1])) {
+        // not kept, or kept as unavailable (read before its part ran): from this slot on, up to the replay's next slot
+        oq_reset_flush(dev);   // before the kept results go: the run's slots are among them
+        uint32_t next = __atomic_load_n(&oq_next, __ATOMIC_RELAXED) % OQ_N, n = OQ_N - q;
+        if (next > q && next - q < n) n = next - q;
+        if (n > OQ_BATCH) n = OQ_BATCH;
+        if (oq_batch_mode == 0) n = 1;
+        oq_read(dev, q, n);
+        k = 0;
+    }
+    OQB.taken[k] = 1;
+    if (OQB.rn && q != OQB.r0 + OQB.rn) oq_reset_flush(dev);
+    if (!OQB.rn) OQB.r0 = q;
+    OQB.rn++;
+    *avail = OQB.v[2 * k + 1] != 0;
+    return OQB.v[2 * k];
 }
 
 static void oq_cb(void *arg) {
     OqSegment *s = arg;
     VkDevice dev = vk_ctx()->device;
-    uint64_t sum = 0, v[64 * 2];
-    for (uint32_t i = 0; i < s->n;) {
-        uint32_t j = i + 1;
-        while (j < s->n && j - i < 64 && s->q[j] == s->q[j - 1] + 1) j++;
+    if (oq_batch_mode < 0) oq_batch_mode = cfg_bool("NX2NAVI_OQ_BATCH");
+    uint64_t sum = 0;
+    for (uint32_t i = 0; i < s->n; i++) {
         // The fence has passed, so a query that is still unavailable will not become available: waiting would block the
         // completion thread, and with it every later callback, for good. It counts as visible (one sample).
-        VkResult r = vkGetQueryPoolResults(dev, oq_pool, s->q[i], j - i, sizeof v, v, 2 * sizeof v[0],
-                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-        if (r != VK_SUCCESS && r != VK_NOT_READY) {
-            vk_device_fault_report(r);
-            rt_fatal("vk: occlusion query results failed (%d)", (int)r);
+        int avail;
+        uint64_t v = oq_take(dev, s->q[i], &avail);
+        if (avail) sum += v;
+        else {
+            sum += 1;
+            vk_device_lost_poll();   // a query its submission never wrote: on a lost device the run ends here
+            LOG_ONCE("vk: occlusion query slot %u not available after its fence, counted as visible", s->q[i]);
         }
-        vkResetQueryPool(dev, oq_pool, s->q[i], j - i);
-        for (uint32_t k = i; k < j; k++) {
-            if (v[2 * (k - i) + 1]) sum += v[2 * (k - i)];
-            else {
-                sum += 1;
-                LOG_ONCE("vk: occlusion query slot %u not available after its fence, counted as visible", s->q[k]);
-            }
-            __atomic_store_n(&oq_busy[s->q[k]], 0, __ATOMIC_RELEASE);
-        }
-        i = j;
+    }
+    if (s->n && ++OQB.segs >= 12000) {
+        if (rt_trace & RT_TRACE_PERF)
+            rt_log("perf: occlusion queries: %llu segments read with %llu result calls of %.1f slots on average",
+                   (unsigned long long)OQB.segs, (unsigned long long)OQB.calls,
+                   OQB.calls ? (double)OQB.slots / (double)OQB.calls : 0.0);
+        OQB.calls = OQB.slots = OQB.segs = 0;
     }
     if (s->reset) oq_count = 0;
     else {
         oq_count += sum;
         if (s->lost && !oq_count) oq_count = 1;
-        if (s->addr) write_counter(s->addr, oq_count), pending_written(s->addr, s->seq);
+        if (s->addr) {
+            if (vk_sync_effect_late()) __atomic_fetch_add(&late_counts, 1, __ATOMIC_RELAXED);
+            write_counter(s->addr, oq_count), pending_written(s->addr, s->seq);
+        }
     }
     free(s);
 }
@@ -315,7 +396,7 @@ static void oq_segment(VkExec *ex, uint64_t addr, int reset) {
     s->addr = addr, s->seq = report_seq, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
     memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
     oq_nseg = 0, oq_lost = 0;
-    vk_completion_add(ex->fence, oq_cb, s);
+    vk_completion_add_result(ex->fence, oq_cb, s);
 }
 
 static void reset_counter(VkExec *ex, const p_reset_counter *p) {
@@ -412,6 +493,22 @@ void vk_exec_event_cpu(const void *event) {
     plat_mutex_unlock(&cpu_ev_lock);
 }
 
+// 1 when the CPU has signalled this event before (nvnEventSignal): its waits are gates the game opens from the CPU.
+int vk_exec_event_cpu_known(const void *event) {
+    plat_mutex_lock(&cpu_ev_lock);
+    int i = 0;
+    while (i < cpu_ev_n && cpu_ev[i].val != event) i++;
+    int known = i < cpu_ev_n;
+    plat_mutex_unlock(&cpu_ev_lock);
+    return known;
+}
+
+// The wait's condition on the value in memory now, whatever the replay has seen. Any thread.
+int vk_exec_event_holds_now(const void *payload) {
+    const p_wait_event *p = payload;
+    return ev_holds(__atomic_load_n(p->val, __ATOMIC_ACQUIRE), p->mode, p->value);
+}
+
 void vk_exec_event_sync(int begin) {
     plat_mutex_lock(&cpu_ev_lock);
     ev_sync_seq = begin ? cpu_ev_seq : UINT64_MAX;
@@ -504,7 +601,7 @@ static void signal_event(VkExec *ex, const p_signal_event *p) {
     EventWrite *e = malloc(sizeof *e);
     if (!e) rt_fatal("vk: out of memory");
     *e = (EventWrite){p->val, p->mode, p->value};
-    vk_completion_add(ex->fence, event_cb, e);
+    vk_completion_add_result(ex->fence, event_cb, e);
 }
 
 static void report_counter(VkExec *ex, const p_report_counter *p) {
@@ -523,7 +620,7 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
         CounterWrite *a = malloc(sizeof *a);
         if (!a) rt_fatal("vk: out of memory");
         *a = (CounterWrite){p->addr, report_seq};
-        vk_completion_add(ex->fence, counter_cb, a);
+        vk_completion_add_result(ex->fence, counter_cb, a);
     }
     Pending *e = pending_slot(p->addr, 1);
     if (e) e->seq = report_seq, e->frame = cond_frame, e->unknown = samples, e->type = (int)p->type;
