@@ -1,5 +1,6 @@
 """Portable game exports with synthetic game files."""
 import sys
+import json
 import tempfile
 import unittest
 import zipfile
@@ -25,6 +26,8 @@ class GameExportTest(unittest.TestCase):
             'nvngx_dlss.dll', 'nvngx_dlss-NOTICE.txt',
             'profile/account.uid', 'profile/save/user/slot1', 'profile/save-tx/ready-7/slot1',
         }
+        from tools.prompt_art import OVERLAYS
+        self.files.update(f'{folder}/{name}' for folder in OVERLAYS for name in ('manifest.tsv', 'button.bin'))
         for name in self.files | {
             'logs/private.log', 'profile/instance.lock', 'profile/save-tx/work/slot1', 'pipeline-cache.bin',
             'build-cache/obj/large.o', 'vulkan-1.dll', 'prod.keys', 'profile/save/user/title.keys',
@@ -32,6 +35,7 @@ class GameExportTest(unittest.TestCase):
             path = self.game / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(name.encode())
+        (self.game / 'build-cache/state.json').write_text(json.dumps({'kit': '0.8.0', 'steps': {'compile': {}}}))
         (self.game / 'nx2navi.ini').write_text(
             '[input]\nbind_a = key:default, pad:south\nROMFS = "D:\\original"\n', encoding='utf-8', newline='\n')
         self.seeds = {'seed-programs.bin': b'programs from game files', 'seed-answers.bin': b'default answers'}
@@ -54,7 +58,8 @@ class GameExportTest(unittest.TestCase):
     def test_cli_exports_playable_files_without_source_paths_or_build_cache(self):
         self.assertEqual(self.export_cli(), 0)
         with zipfile.ZipFile(self.out) as archive:
-            self.assertEqual(set(archive.namelist()), self.files | self.seeds.keys() | {'README.txt', 'nx2navi.ini', 'profile/'})
+            self.assertEqual(set(archive.namelist()), self.files | self.seeds.keys() | {'README.txt', 'nx2navi.ini', 'profile/', 'GAME-MANIFEST.json'})
+            self.assertEqual(json.loads(archive.read('GAME-MANIFEST.json'))['version'], '0.8.0')
             for name in self.files:
                 self.assertEqual(archive.read(name), name.encode())
             for name, data in self.seeds.items():
@@ -74,10 +79,10 @@ class GameExportTest(unittest.TestCase):
     def test_minimal_cli_export_omits_personal_data_and_shader_caches(self):
         self.assertEqual(self.export_cli('--minimal'), 0)
         with zipfile.ZipFile(self.out) as archive:
-            omitted = {'shader-cache/program.spv', 'shader-programs.bin', 'romfs-patches-steamdeck/manifest.tsv',
+            omitted = {'shader-cache/program.spv', 'shader-programs.bin',
                        'nvngx_dlss.dll', 'nvngx_dlss-NOTICE.txt', 'pipeline-keys.bin', 'Prepare Graphics.exe',
                        'profile/account.uid', 'profile/save/user/slot1', 'profile/save-tx/ready-7/slot1'}
-            self.assertEqual(set(archive.namelist()), self.files - omitted | {'README.txt', 'profile/'})
+            self.assertEqual(set(archive.namelist()), self.files - omitted | {'README.txt', 'profile/', 'GAME-MANIFEST.json'})
 
     def test_large_members_use_zip64(self):
         from launcher import game_export

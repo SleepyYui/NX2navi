@@ -1,5 +1,7 @@
 """Portable patches compare file content and preserve personal data."""
 import json
+import io
+import struct
 from pathlib import Path
 import sys
 import tempfile
@@ -56,6 +58,66 @@ class GamePatchTest(unittest.TestCase):
         data = path.read_bytes()
         path.write_bytes(data)
         self.assertEqual(self.create()['changed'], 0)
+
+    def test_patch_adds_prompt_art_and_removes_obsolete_prompt_files(self):
+        from tools.prompt_art import OVERLAYS
+        with zipfile.ZipFile(self.baseline, 'a') as z:
+            z.writestr('romfs-patches-xbox/obsolete.bin', b'old')
+        expected = set()
+        for folder in OVERLAYS:
+            for name in ('manifest.tsv', 'button.bin'):
+                path = self.game / folder / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'prompt artwork')
+                expected.add(f'{folder}/{name}')
+        result = self.create()
+        self.assertEqual(result['changed'], len(expected))
+        self.assertEqual(result['removed'], 1)
+        with zipfile.ZipFile(self.output) as z:
+            self.assertTrue(expected <= set(z.namelist()))
+
+    def test_versions_name_patch_and_are_recorded_for_the_next_update(self):
+        from launcher import game_patch
+        with zipfile.ZipFile(self.baseline, 'a') as z:
+            z.writestr('GAME-MANIFEST.json', json.dumps({'format': 1, 'version': '0.7.1'}))
+        (self.game / 'build-cache').mkdir()
+        (self.game / 'build-cache/state.json').write_text(json.dumps({'kit': '0.8.0', 'steps': {'compile': {}}}))
+        self.assertEqual(game_patch.patch_versions(self.game, self.baseline), ('0.7.1', '0.8.0'))
+        self.assertEqual(game_patch.patch_filename('0.7.1', '0.8.0'), 'Ocarina of Time - Patch 0.7.1 to 0.8.0.zip')
+        self.create()
+        with zipfile.ZipFile(self.output) as z:
+            manifest = json.loads(z.read('PATCH-MANIFEST.json'))
+            self.assertEqual((manifest['from_version'], manifest['to_version']), ('0.7.1', '0.8.0'))
+            self.assertIn(b'0.7.1 to 0.8.0', z.read('PATCH-README.txt'))
+            self.assertEqual(json.loads(z.read('GAME-MANIFEST.json'))['version'], '0.8.0')
+
+    def test_legacy_executable_version_and_stripped_or_malformed_fallback(self):
+        from launcher import game_version
+        image = bytearray(1024)
+        image[:2] = b'MZ'
+        struct.pack_into('<I', image, 60, 128)
+        image[128:132] = b'PE\0\0'
+        struct.pack_into('<HHIIIHH', image, 132, 0x8664, 1, 0, 512, 1, 0, 0)
+        struct.pack_into('<II', image, 152 + 16, 128, 256)
+        image[264:270] = b'0.7.1\0'
+        struct.pack_into('<IIIhHBB', image, 512, 0, 4, 8, 1, 0, 2, 0)
+        strings = b'rt_port_version\0'
+        struct.pack_into('<I', image, 530, 4 + len(strings))
+        image[534:534 + len(strings)] = strings
+        self.assertEqual(game_version.executable(io.BytesIO(image)), '0.7.1')
+        struct.pack_into('<I', image, 140, 0)
+        self.assertEqual(game_version.executable(io.BytesIO(image)), '')
+        for value in (b'', b'MZ', b'MZ' + b'\xff' * 150):
+            self.assertEqual(game_version.executable(io.BytesIO(value)), '')
+
+    def test_manual_versions_override_missing_detection_and_reject_unsafe_names(self):
+        from launcher import game_patch
+        self.create(from_version='v0.7.1', to_version='0.8.0+build')
+        with zipfile.ZipFile(self.output) as z:
+            manifest = json.loads(z.read('PATCH-MANIFEST.json'))
+            self.assertEqual((manifest['from_version'], manifest['to_version']), ('0.7.1', '0.8.0'))
+        with self.assertRaises(ValueError):
+            game_patch.patch_filename('../outside', '0.8.0')
 
     def test_zip_with_single_top_level_folder_is_supported(self):
         self.write_baseline('Ocarina/')

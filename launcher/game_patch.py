@@ -8,7 +8,7 @@ import stat
 import tempfile
 import zipfile
 
-from . import game_export, net
+from . import game_export, game_version, net
 
 
 def _path(name):
@@ -44,7 +44,28 @@ def _managed(name):
     parts = name.split('/')
     if len(parts) == 1:
         return name.endswith(('.exe', '.dll', '-notice.txt', '-license.txt')) or name == 'romfs-index.bin'
-    return parts[0] in ('romfs', 'exefs', 'shared-fonts', 'romfs-patches') or name.startswith('mods/damaged file stand-ins/')
+    return (parts[0] in ('romfs', 'exefs', 'shared-fonts', 'romfs-patches', *game_export.OVERLAYS)
+            or game_export.aspect_overlay(parts[0]) or name.startswith('mods/damaged file stand-ins/'))
+
+
+def _baseline_version(archive, files):
+    if game_version.MANIFEST.lower() in files:
+        with archive.open(files[game_version.MANIFEST.lower()]) as source:
+            version = game_version.read_manifest(source)
+        if version:
+            return version
+    with archive.open(files['ocarina.exe']) as source:
+        return game_version.executable(source)
+
+
+def patch_versions(game, baseline):
+    with zipfile.ZipFile(baseline) as archive:
+        return _baseline_version(archive, _members(archive)), game_version.installed(game)
+
+
+def patch_filename(from_version, to_version):
+    start, end = (game_version.clean(v) for v in (from_version, to_version))
+    return f'Ocarina of Time - Patch {start} to {end}.zip'
 
 
 def _signature(path):
@@ -62,7 +83,8 @@ def _hash(stream, cancel, advance):
     return digest.hexdigest()
 
 
-def create(game, baseline, output, *, progress=lambda fraction, detail: None, cancel=lambda: False):
+def create(game, baseline, output, *, from_version='', to_version='',
+           progress=lambda fraction, detail: None, cancel=lambda: False):
     game, baseline, output = (Path(p).resolve() for p in (game, baseline, output))
     if output.suffix.lower() != '.zip' or output == baseline or output.is_relative_to(game):
         raise ValueError('choose a new patch ZIP outside the game folder and different from the original ZIP')
@@ -75,6 +97,8 @@ def create(game, baseline, output, *, progress=lambda fraction, detail: None, ca
     pending = None
     with zipfile.ZipFile(baseline) as archive:
         base = _members(archive)
+        start = game_version.clean(from_version) if from_version else _baseline_version(archive, base)
+        end = game_version.clean(to_version) if to_version else game_version.installed(game)
         work = sum(value[0] for value in original.values()) + sum(
             base[name.casefold()].file_size for name in files if name.casefold() in base
             and base[name.casefold()].file_size == original[name][0])
@@ -110,8 +134,14 @@ def create(game, baseline, output, *, progress=lambda fraction, detail: None, ca
         needed = sum(original[name][0] for name in changed)
         if shutil.disk_usage(output.parent).free < needed + 65536:
             raise ValueError(f'the patch needs up to {needed / 1e9:.1f} GB free at the destination')
-        manifest = {'format': 1, 'baseline': baseline.name, 'files': changed, 'removed': removed}
+        version_data = game_version.metadata(end).encode('utf-8') if end else None
+        hashes = dict(changed)
+        if version_data:
+            hashes[game_version.MANIFEST] = hashlib.sha256(version_data).hexdigest()
+        manifest = {'format': 1, 'baseline': baseline.name, 'from_version': start, 'to_version': end,
+                    'files': hashes, 'removed': removed}
         readme = ('Ocarina of Time game patch\n\n'
+                  + (f'Update {start} to {end}.\n' if start and end else '') +
                   f'Created for the game extracted from {baseline.name}.\n'
                   'Close the game. Extract this ZIP into the folder containing ocarina.exe\n'
                   'and replace the existing files when asked.\n\n'
@@ -126,6 +156,8 @@ def create(game, baseline, output, *, progress=lambda fraction, detail: None, ca
                 with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as patch:
                     patch.writestr('PATCH-README.txt', readme)
                     patch.writestr('PATCH-MANIFEST.json', json.dumps(manifest, indent=2) + '\n')
+                    if version_data:
+                        patch.writestr(game_version.MANIFEST, version_data)
                     written = 0
                     for name, expected in changed.items():
                         info = zipfile.ZipInfo.from_file(files[name], name, strict_timestamps=False)

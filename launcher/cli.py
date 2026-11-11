@@ -68,6 +68,8 @@ def main(argv=None):
     p.add_argument('--game')
     p.add_argument('--base', required=True, help='the original full portable game ZIP')
     p.add_argument('--out', required=True, help='the ZIP of changed files to create')
+    p.add_argument('--from-version', default='', help='override the original ZIP version')
+    p.add_argument('--to-version', default='', help='override the updated game version')
     p = sub.add_parser('fonts')
     p.add_argument('--dump', default='')
     p.add_argument('--game', default='')
@@ -84,7 +86,7 @@ def main(argv=None):
             print('error: select the updated game with --game', file=sys.stderr)
             return 1
         try:
-            result = game_patch.create(gd, a.base, a.out)
+            result = game_patch.create(gd, a.base, a.out, from_version=a.from_version, to_version=a.to_version)
         except (OSError, ValueError, zipfile.BadZipFile) as error:
             print(f'error: {error}', file=sys.stderr)
             return 1

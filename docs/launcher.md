@@ -123,6 +123,8 @@ compile during play.
 The command-line equivalent is
 `python -m launcher.cli export --game "C:\Games\Ocarina" --out "D:\Ocarina Portable.zip"`.
 Add `--minimal` for a game-only ZIP.
+Both export modes include the generated button-prompt overlays, so changing controller artwork works after
+restarting the exported game. `GAME-MANIFEST.json` records its version for later patches.
 
 ## Patching an exported game
 
@@ -130,6 +132,8 @@ Open **Game Patcher** in the launcher, or **Game Patcher.exe** in the installed 
 full game ZIP, the updated game folder, and the patch ZIP to create. The tool compares file contents with SHA-256
 and writes complete new and changed runtime files into a compressed ZIP. It includes neither saves nor settings
 nor shader caches. The original ZIP can be used again for a later cumulative patch.
+The window reads both versions and suggests a name such as `Ocarina of Time - Patch 0.7.1 to 0.8.0.zip`.
+If an older executable has no readable version, enter it in **From version** or **To version**.
 
 Close the game on the destination PC, then extract the patch over its game folder and replace files when asked.
 If a runtime file was removed, `PATCH-README.txt` names it for removal. `PATCH-MANIFEST.json` records the changed
@@ -137,6 +141,7 @@ files and the hashes of obsolete files. A patch ZIP cannot be used as the full b
 
 The command-line equivalent is
 `python -m launcher.cli patch --game "C:\Games\Ocarina" --base "D:\Ocarina.zip" --out "D:\Ocarina Patch.zip"`.
+Use `--from-version` and `--to-version` to supply versions that cannot be detected.
 
 ## The launcher's folder
 

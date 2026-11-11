@@ -1,13 +1,15 @@
 """Export a built Windows game as a private, portable ZIP64 archive."""
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
 
-from . import build, gameini, net
+from . import build, gameini, game_version, net
+from tools.prompt_art import OVERLAYS
 from .paths import APP, Layout
 
 REQUIRED = ('ocarina.exe', 'SDL3.dll', 'libopus-0.dll', 'nx2navi_xlate.exe', 'romfs-index.bin', 'romfs/romfs.bin',
@@ -48,7 +50,8 @@ def _files(game, minimal=False):
     names = [*REQUIRED, 'nx2navi_xlate.id']
     folders = ['exefs', 'shared-fonts']
     if minimal:
-        folders += ['romfs-patches', 'mods/Damaged file stand-ins']
+        folders += ['romfs-patches', *OVERLAYS, 'mods/Damaged file stand-ins']
+        folders += [p.name for p in game.iterdir() if aspect_overlay(p.name)]
     else:
         names.extend(CACHE_FILES)
         folders += ['shader-cache', 'mods', *(p.name for p in game.glob('romfs-patches*'))]
@@ -78,6 +81,10 @@ def _files(game, minimal=False):
     saves = _collect(profile, ('account.uid',), ('save', 'save-import', 'save-tx/new', 'save-tx/old', *recovery))
     files.update({f'profile/{name}': path for name, path in saves.items()})
     return files
+
+
+def aspect_overlay(name):
+    return bool(re.fullmatch(r'romfs-patches-(?:pc-)?[1-9][0-9]*x[1-9][0-9]*', name))
 
 
 def _readme(game, minimal=False):
@@ -167,6 +174,7 @@ def _write_zip(game, out, files, minimal, progress, cancel):
             tmp = Path(f.name)
             with zipfile.ZipFile(f, 'w') as archive:
                 archive.writestr('README.txt', _readme(game, minimal))
+                archive.writestr(game_version.MANIFEST, game_version.metadata(game_version.installed(game)))
                 archive.mkdir('profile')
                 if ini:
                     archive.writestr('nx2navi.ini', ini.encode('utf-8', 'surrogateescape'))
