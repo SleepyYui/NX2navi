@@ -922,6 +922,21 @@ static void upscaling_name(char *out, size_t size) {
     else snprintf(out, size, mode ? "DLSS %s" : "NVIDIA %s", menu_text(dlss[mode]));
 }
 
+// The Anti-aliasing row's value for the performance overlay: what row_aa shows, with "TAA + " before it while DLSS's or
+// FSR's TAA runs with it (as upscaling_name tells it: FSR 3.1 set where it cannot load runs nothing), and TAA alone
+// for off then.
+static void aa_name(char *out, size_t size) {
+    static const char *const values[] = {"game", "off", "fxaa", "smaa"};
+    static const UiTextId names[] = {UI_MENU_AA_GAME, UI_MENU_FRAMEGEN_OFF, UI_MENU_AA_FXAA, UI_MENU_AA_SMAA};
+    int i = 0;
+    for (int k = 0; k < 4; k++)
+        if (!strcmp(cfg_value("NX2NAVI_AA"), values[k])) i = k;   // taa: the game's SMAA, with the upscaler or alone
+    const bool taa = cfg_bool("NX2NAVI_DLAA") && (strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") || vk_ffx_available());
+    if (taa && i == 1) snprintf(out, size, "TAA");
+    else if (taa) snprintf(out, size, "TAA + %s", menu_text(names[i]));
+    else snprintf(out, size, "%s", menu_text(names[i]));
+}
+
 // The Upscaling row's NVIDIA DLSS waits for a restart (vk_dlaa_needs_restart), where DLSS is offered: the row's note and
 // the Restart button's count (restart_pending).
 static bool upscaling_restart(void) { return dlss_offered() && vk_dlaa_needs_restart(); }
@@ -989,43 +1004,48 @@ static void row_upscaling(void) {
     // FSR 4 that failed in a row stays listed (it runs on this device) while FSR 3.1 serves: the row shows FSR 3.1, and
     // choosing FSR 4 again tries it anew
     if (e.kind == FSR4) vk_ffx4_retry();
-    // the Anti-aliasing row follows: DLSS and FSR 3.1 are its TAA, and leaving them leaves TAA for the game's SMAA
-    if (e.kind >= DLSS) opt_apply("NX2NAVI_AA", "taa");
-    else if (!strcmp(cfg_value("NX2NAVI_AA"), "taa")) opt_apply("NX2NAVI_AA", "game");
+    // The Anti-aliasing row keeps its choice, which runs along with DLSS's or FSR's TAA (vk_aa.c vk_aa_mode); its TAA
+    // went with the temporal mode, so leaving that leaves the game's SMAA
+    if (e.kind < DLSS && !strcmp(cfg_value("NX2NAVI_AA"), "taa")) opt_apply("NX2NAVI_AA", "game");
 }
 
 // Anti-aliasing (vk_aa.c NX2NAVI_AA): the game's own SMAA (the default), off, FXAA or SMAA in its place, or TAA, which is
-// DLSS or FSR 3.1 at the scene's size, the Upscaling row's temporal modes. TAA is listed where one of them runs: NVIDIA
-// DLAA where DLSS is offered, else FSR 3.1 Native AA where it loads. While a temporal mode is set (dlaa), the row shows
-// TAA, noted as the Upscaling row's when that mode also scales. Choosing TAA sets the upscaler to the native mode;
-// choosing another value turns the temporal upscaler off, with frame generation, which needs it, as the Upscaling row
-// does for bilinear and FSR 1, and the picture is then fitted to the window as that row had it.
+// DLSS or FSR at the scene's size, the Upscaling row's temporal modes. Without a temporal mode set (dlaa), TAA is listed
+// where one runs: NVIDIA DLAA where DLSS is offered and taa does not name FSR, else FSR 4 Native AA where it runs, else
+// FSR 3.1 Native AA where it loads; choosing it sets that native mode, as the Upscaling row would. While a temporal mode
+// is set its TAA always runs, and the row picks what runs with it: the game's SMAA, nothing, FXAA or SMAA, noted as joined
+// by the Upscaling row's TAA. A choice then leaves the upscaler and frame generation as they are. taa itself, set before
+// or in the ini, shows as the game's SMAA, which is what runs with the upscaler (or without one, where it cannot run).
 static void row_aa(void) {
     enum { GAME, OFF, FXAA, SMAA, TAA };
     static const char *const values[] = {"game", "off", "fxaa", "smaa", "taa"};
-    const bool dlss = dlss_offered(), fsr = vk_ffx_available(), temporal = cfg_bool("NX2NAVI_DLAA");
-    const bool fsr_set = !strcmp(cfg_value("NX2NAVI_TAA"), "fsr3");
+    const bool dlss = dlss_offered(), fsr = vk_ffx_available(), fsr4 = fsr && vk_ffx4_available();
+    const bool temporal = cfg_bool("NX2NAVI_DLAA"), fsr_set = !strcmp(cfg_value("NX2NAVI_TAA"), "fsr3");
     const char *names[5] = {menu_text(UI_MENU_AA_GAME), menu_text(UI_MENU_FRAMEGEN_OFF), menu_text(UI_MENU_AA_FXAA),
                             menu_text(UI_MENU_AA_SMAA), nullptr};
     int n = 4;
-    if (dlss || fsr || temporal)
-        names[n++] = menu_text((temporal ? !fsr_set : dlss) ? UI_MENU_AA_TAA_DLSS : UI_MENU_AA_TAA_FSR);
+    enum { NONE, K_DLSS, K_FSR3, K_FSR4 };
+    const int kind = dlss && (!fsr_set || !fsr) ? K_DLSS : fsr4 ? K_FSR4 : fsr ? K_FSR3 : NONE;
+    static char taa[96];
+    if (!temporal && kind) {
+        if (kind == K_FSR4) snprintf(taa, sizeof taa, menu_text(UI_MENU_AA_TAA_FSR4), fsr4_label());
+        else snprintf(taa, sizeof taa, "%s", menu_text(kind == K_DLSS ? UI_MENU_AA_TAA_DLSS : UI_MENU_AA_TAA_FSR));
+        names[n++] = taa;
+    }
     int cur = GAME;
-    if (temporal) cur = TAA;
-    else
-        for (int i = 0; i < 4; i++)
-            if (!strcmp(cfg_value("NX2NAVI_AA"), values[i])) cur = i;
-    const char *note = temporal && strcmp(cfg_value("NX2NAVI_DLSS"), "dlaa") ? menu_text(UI_MENU_AA_UPSCALER) : nullptr;
+    for (int i = 0; i < 4; i++)
+        if (!strcmp(cfg_value("NX2NAVI_AA"), values[i])) cur = i;
+    // FSR 3.1 set where it cannot load runs nothing (the Upscaling row says so): no TAA joins the choice then
+    const char *note = temporal && (!fsr_set || fsr) ? menu_text(UI_MENU_AA_WITH_TAA) : nullptr;
     int nv = opt_choice_index("NX2NAVI_AA", UI_MENU_AA, names, n, cur, GAME, UI_MENU_AA_DESC, note);
     if (nv < 0 || nv >= n || nv == cur) return;
-    if (nv == TAA) {
+    if (nv == TAA) {   // listed only without a temporal mode: the native one of that upscaler, as row_upscaling sets it
+        opt_apply("NX2NAVI_UPSCALER", "bilinear");
         opt_apply("NX2NAVI_DLAA", "1");
         opt_apply("NX2NAVI_DLSS", "dlaa");
-        opt_apply("NX2NAVI_TAA", dlss ? "dlss" : "fsr3");
-        if (!dlss) opt_apply("NX2NAVI_FSR4", "0");
-    } else if (temporal) {
-        opt_apply("NX2NAVI_DLAA", "0");
-        opt_apply("NX2NAVI_FRAMEGEN", "off");
+        opt_apply("NX2NAVI_TAA", kind == K_DLSS ? "dlss" : "fsr3");
+        if (kind != K_DLSS) opt_apply("NX2NAVI_FSR4", kind == K_FSR4 ? "1" : "0");
+        if (kind == K_FSR4) vk_ffx4_retry();
     }
     opt_apply("NX2NAVI_AA", values[nv]);
 }
@@ -1874,27 +1894,28 @@ static void perf_picture(const MenuTarget *t, PerfPanel *p) {
     snprintf(v[1], sizeof v[1], menu_text(UI_MENU_OV_FMT_SIZE), (unsigned)t->image_w, (unsigned)t->image_h);
     snprintf(v[2], sizeof v[2], menu_text(UI_MENU_OV_FMT_SCENE), scene[0], scene[1], scene[0] * 100.0 / out[0]);
     upscaling_name(v[3], sizeof v[3]);
+    aa_name(v[4], sizeof v[4]);
     double hz = frame_step_limit_hz();
-    snprintf(v[4], sizeof v[4], "%s", menu_text(UI_MENU_OV_NONE));
-    if (hz > 0) snprintf(v[4], sizeof v[4], menu_text(UI_MENU_OV_FPS), hz);
-    snprintf(v[5], sizeof v[5], "%s", menu_text(strcmp(cfg_value("NX2NAVI_VK_PRESENT"), "immediate") ? UI_MENU_ON : UI_MENU_OFF));
-    v[6][0] = v[7][0] = 0;
+    snprintf(v[5], sizeof v[5], "%s", menu_text(UI_MENU_OV_NONE));
+    if (hz > 0) snprintf(v[5], sizeof v[5], menu_text(UI_MENU_OV_FPS), hz);
+    snprintf(v[6], sizeof v[6], "%s", menu_text(strcmp(cfg_value("NX2NAVI_VK_PRESENT"), "immediate") ? UI_MENU_ON : UI_MENU_OFF));
+    v[7][0] = v[8][0] = 0;
     if (wide_available()) {
         const char *a = cfg_value("NX2NAVI_GAME_ASPECT");
-        snprintf(v[6], sizeof v[6], "%s", menu_text(!strcmp(a, "window") ? UI_MENU_GAME_ASPECT_WINDOW : !strcmp(a, "21:9") ? UI_MENU_GAME_ASPECT_21_9
+        snprintf(v[7], sizeof v[7], "%s", menu_text(!strcmp(a, "window") ? UI_MENU_GAME_ASPECT_WINDOW : !strcmp(a, "21:9") ? UI_MENU_GAME_ASPECT_21_9
                                                     : !strcmp(a, "32:9") ? UI_MENU_GAME_ASPECT_32_9 : UI_MENU_GAME_ASPECT_16_9));
         const char *r = cfg_value("NX2NAVI_GAME_RES");
-        if (!strcmp(r, "window")) snprintf(v[7], sizeof v[7], "%s", menu_text(UI_MENU_GAME_RES_NATIVE));
-        else snprintf(v[7], sizeof v[7], "%sp", r);
+        if (!strcmp(r, "window")) snprintf(v[8], sizeof v[8], "%s", menu_text(UI_MENU_GAME_RES_NATIVE));
+        else snprintf(v[8], sizeof v[8], "%sp", r);
     }
     const char *hdr = cfg_value("NX2NAVI_HDR");
-    snprintf(v[8], sizeof v[8], "%s", menu_text(!strcmp(hdr, "native") ? UI_MENU_HDR_NATIVE : cfg_bool("NX2NAVI_HDR") ? UI_MENU_HDR_TONEMAPPED : UI_MENU_FRAMEGEN_OFF));
+    snprintf(v[9], sizeof v[9], "%s", menu_text(!strcmp(hdr, "native") ? UI_MENU_HDR_NATIVE : cfg_bool("NX2NAVI_HDR") ? UI_MENU_HDR_TONEMAPPED : UI_MENU_FRAMEGEN_OFF));
     const char *fg = cfg_value("NX2NAVI_FRAMEGEN");
     const bool fsr_fg = !strcmp(fg, "fsr3") && vk_ffx_framegen_available();   // set but not loadable: off
-    snprintf(v[9], sizeof v[9], "%s", fsr_fg ? (vk_fg4_active() ? fg4_label() : "AMD FSR 3.1")
+    snprintf(v[10], sizeof v[10], "%s", fsr_fg ? (vk_fg4_active() ? fg4_label() : "AMD FSR 3.1")
                                       : !strcmp(fg, "dlss") ? "NVIDIA DLSS" : menu_text(UI_MENU_FRAMEGEN_OFF));
     if (!strcmp(fg, "dlss") && vk_dlssg_active())   // its multiplier as set, clamped to what this GPU allows
-        snprintf(v[9], sizeof v[9], "NVIDIA DLSS %dx",
+        snprintf(v[10], sizeof v[10], "NVIDIA DLSS %dx",
                  vk_dlssg_multiplier_of(cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER"), vk_dlssg_multiplier_max(nullptr), nullptr));
     // The 3D scene's size is known only where resolution.c sets it (the builds with its patch sets); Ocarina sizes its
     // own scene dynamically and res_sizes would report a fixed 1600x900, so the line is left out

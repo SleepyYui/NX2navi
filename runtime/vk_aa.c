@@ -10,9 +10,11 @@
 // replace the composition (vk_exec_draw.c aa_dispatch) with one of the passes here, which read the same composite and
 // write the same words: off stores it as it is, fxaa smooths it first (shaders/aa_post.comp), smaa runs SMAA at its
 // Ultra preset (shaders/smaa_*.comp, the reference implementation in shaders/smaa.glsl with the area and search
-// textures of third_party/smaa). taa is DLSS or FSR 3.1 at the scene's own size: the menu sets the upscaler for it
-// (ui/menu.cpp row_aa). While DLSS or FSR 3.1 anti-aliases the scene (dlaa = 1 and it runs), the game's SMAA stays as it
-// is whatever aa says: they take the picture after it, and their inputs are tuned with it.
+// textures of third_party/smaa). taa is DLSS or FSR at the scene's own size: the menu sets the upscaler for it
+// (ui/menu.cpp row_aa), and the game's SMAA runs with it. While DLSS or FSR anti-aliases or scales the scene (dlaa = 1),
+// game, off, fxaa and smaa still choose the pass above: in their native modes the upscalers run before the bloom (vk_dlaa.c,
+// "where DLAA runs") and the pass smooths their picture after it, in the scaling modes the pass runs on the scene first
+// and the upscaler scales its result. off then leaves the upscaler's TAA alone on the edges.
 //
 // The game's passes are known by a hash of their guest code (vk_aa_role), which does not change with the translator or
 // its settings. Everything here runs on the replay thread.
@@ -61,13 +63,13 @@ int vk_aa_role(uint64_t guest_hash) {
 
 static const char *const NAMES[] = {"game", "off", "fxaa", "smaa"};
 
-// DLSS or FSR 3.1 anti-aliases this frame's scene: dlaa = 1 and one of them runs (vk_dlaa.c)
+// DLSS or FSR anti-aliases this frame's scene: dlaa = 1 and one of them runs (vk_dlaa.c)
 static int temporal(void) { return cfg_bool("NX2NAVI_DLAA") && (vk_dlaa_available() || vk_dlaa_fsr3()); }
 
 static struct {
     uint64_t frame_read;
     int mode;              // this frame's (vk_aa_mode)
-    int said;              // the last refusal logged: 1 + the mode refused, 0 none
+    int said;              // taa was last logged as waiting for DLSS or FSR
     int composed;          // the last composition seen was replaced (vk_aa_composed): the passes before it may go
     uint64_t frames_on, composes;   // frames with a replacement asked for, compositions replaced
     int none_told;
@@ -81,14 +83,13 @@ int vk_aa_mode(void) {
     int want = VK_AA_GAME;
     for (int i = 1; i < 4; i++)
         if (!strcmp(v, NAMES[i])) want = i;
-    int tmp = want != VK_AA_GAME && temporal();
-    int said = tmp ? 1 + want : !strcmp(v, "taa") && !temporal() ? 1 + 4 : 0;
+    // taa is the game's SMAA with DLSS's or FSR's TAA; without them at work, the game's SMAA alone
+    int said = !strcmp(v, "taa") && !temporal();
     if (said != A.said) {
         A.said = said;
-        if (said == 5) rt_log("aa: taa needs DLSS or FSR 3.1 at work (dlaa = 1): the game's SMAA stays");
-        else if (said) rt_log("aa: %s waits while DLSS or FSR 3.1 anti-aliases the scene: the game's SMAA stays", NAMES[want]);
+        if (said) rt_log("aa: taa needs DLSS or FSR at work (dlaa = 1): the game's SMAA stays");
     }
-    A.mode = tmp ? VK_AA_GAME : want;
+    A.mode = want;
     if (A.mode != VK_AA_GAME && !A.none_told && ++A.frames_on == 3600 && !A.composes) {
         A.none_told = 1;   // a game version or a frame without the passes this file knows: nothing is replaced
         rt_log("aa: aa = %s found none of the game's SMAA passes in %llu frames: the picture stays the game's",

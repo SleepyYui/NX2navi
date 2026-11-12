@@ -461,15 +461,20 @@ static const struct { VkImageType t; VkImageViewType vt; uint32_t layers; VkSamp
     {VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 1, VK_SAMPLE_COUNT_4_BIT, 0},
     {VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, VK_SAMPLE_COUNT_4_BIT, 0}};
 
-// A 1x1 stand-in image of view type dinfo[i] in `fmt`, moved to GENERAL by the upload batch (which reaches the queue before
-// the submission that uses it). *sview is the view a storage descriptor takes (a cube becomes a 2D array).
-static void make_dummy(int i, VkFormat fmt, VkImage *image, VmaAllocation *alloc, VkImageView *view, VkImageView *sview) {
+// A 1x1 stand-in image of view type dinfo[i] in `fmt`, moved to GENERAL and cleared to `clear` by the upload batch (which
+// reaches the queue before the submission that uses it). *sview is the view a storage descriptor takes (a cube becomes a
+// 2D array). Left uncleared its content was undefined, and a material that read its roughness map through one (a slot
+// with no texture yet) could see roughness near 0: on Kakariko's distant cliffs at night the specular term reached
+// 3392 in single pixels, which bloom and the temporal upscaler spread into bright white spots.
+static void make_dummy(int i, VkFormat fmt, const VkClearColorValue *clear, VkImage *image, VmaAllocation *alloc,
+                       VkImageView *view, VkImageView *sview) {
     VkCtx *c = vk_ctx();
     int ms = dinfo[i].s != VK_SAMPLE_COUNT_1_BIT;
     VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = dinfo[i].f, .imageType = dinfo[i].t,
                             .format = fmt, .extent = {1, 1, 1}, .mipLevels = 1, .arrayLayers = dinfo[i].layers,
                             .samples = dinfo[i].s, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | (ms ? 0 : VK_IMAGE_USAGE_STORAGE_BIT),
+                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                     (ms ? 0 : VK_IMAGE_USAGE_STORAGE_BIT),
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VmaAllocationCreateInfo ia = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     if (vmaCreateImage(c->vma, &ii, &ia, image, alloc, NULL) != VK_SUCCESS) rt_fatal("vk: stand-in image %d failed", i);
@@ -490,9 +495,22 @@ static void make_dummy(int i, VkFormat fmt, VkImage *image, VmaAllocation *alloc
                                  .image = *image, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, dinfo[i].layers}};
     VkCommandBuffer cb = vk_upload_begin();
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &bar};
+    bar.dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT, bar.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier2(cb, &di);
+    vkCmdClearColorImage(cb, *image, VK_IMAGE_LAYOUT_GENERAL, clear, 1, &bar.subresourceRange);
+    bar.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT, bar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    bar.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    bar.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    bar.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
     vkCmdPipelineBarrier2(cb, &di);
     vk_upload_end();
 }
+
+// Sampled stand-ins read as mid grey, opaque: a missing roughness or metalness map gives a middling value, a missing
+// two-channel normal map a flat normal, a missing colour map grey. Storage stand-ins (any format, written by shaders that
+// have no image) start at zero.
+static const VkClearColorValue DUMMY_SAMPLED = {.float32 = {0.5f, 0.5f, 0.5f, 1.0f}};
+static const VkClearColorValue DUMMY_STORAGE = {.uint32 = {0, 0, 0, 0}};
 
 // Storage image stand-ins in the format a shader declares (GfxShaderRes.format: the translator's TextureFormat order); Vulkan wants
 // the view format to match the declaration. Created on first use.
@@ -514,7 +532,7 @@ static VkImageView storage_dummy(int di, int code) {
     for (int i = 0; i < 48; i++) {
         if (!SD[i].used) {
             SD[i].used = 1, SD[i].di = di, SD[i].fmt = fmt;
-            make_dummy(di, fmt, &SD[i].image, &SD[i].alloc, &SD[i].view, &SD[i].sview);
+            make_dummy(di, fmt, &DUMMY_STORAGE, &SD[i].image, &SD[i].alloc, &SD[i].view, &SD[i].sview);
             return SD[i].sview;
         }
         if (SD[i].di == di && SD[i].fmt == fmt) return SD[i].sview;
@@ -550,7 +568,7 @@ static void dummies_init(void) {
     Z.samp_shadow = vk_sampler_for(&sp);
 
     for (int i = 0; i < DV_COUNT; i++)
-        make_dummy(i, VK_FORMAT_R8G8B8A8_UNORM, &Z.img[i].image, &Z.img[i].alloc, &Z.img[i].view, &Z.img[i].sview);
+        make_dummy(i, VK_FORMAT_R8G8B8A8_UNORM, &DUMMY_SAMPLED, &Z.img[i].image, &Z.img[i].alloc, &Z.img[i].view, &Z.img[i].sview);
     Z.ready = 1;
 }
 
@@ -3819,6 +3837,19 @@ static int pipe_skip_mode(void) {
 // cold it runs out after a few draws and the rest are skipped as before, so a burst of cold pipelines costs a frame
 // this much and no more. Measured on an RX 7900 XT, first walk through a village with no pipeline recorded: 2,349
 // draws skipped without the budget, with the libraries warm in both runs.
+// NX2NAVI_PIPE_LINK_DRAW_MS (default 3): the wait for one pipeline, counted from its first miss and shared by all its
+// draws (prepare_draw_ex), so a pipeline whose libraries the driver has to compile costs its first frame this much and
+// the frames after it nothing; it was 3 ms for each draw, in every frame. A frame that has left a draw out already
+// waits for no fast link either (pending_draws): it is held back or shown without that draw whatever its other
+// pipelines do.
+// The 3 ms are just under what a pipeline takes with its two shader libraries in the driver's cache: on a new
+// install's first visits (RTX 5090, the libraries prepared, 67 pipelines the install's list did not hold) 44 were
+// usable under 4 ms after their miss, 17 after 4 to 8 ms and 6 later, and of 87 draws that waited 66 were skipped at
+// the end of the wait, their frame then held back. 8 ms a pipeline and 16 ms a frame were tried for that. A scripted
+// walk through a village with no pipeline recorded (610 missed) had the picture stand still 15 times against 50 and
+// 15 frames over 25 ms against 17, but in play it felt worse to the player than the 3 ms it replaced, in two sessions
+// on the same install: a frame that takes 10 to 14 ms longer showed more than one that is left out. The waits stay
+// short; the settings take longer ones.
 // NX2NAVI_PIPE_FRAME_WAIT_MS (default 50; 0 to 500): the wait pool of one presented frame. Its full-screen draws and
 // its one-shot draws (NX2NAVI_ONESHOT_BUDGET) wait for their shaders and pipelines from it, each for what the ones
 // before left, and are skipped once it is spent, so the pipelines of one frame hold the replay thread this long in
@@ -4195,7 +4226,9 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         if (wait_ms) t0 = kern_now_ns();
     } else {
         budget = link_budget();
-        wait_ms = (uint32_t)(*budget / 1000000);
+        // A frame that has left a draw out already is not shown, or is shown without that draw (pending_draws,
+        // vk_backend.c frame_hold): a wait for another pipeline would only make it later.
+        wait_ms = pending_draws ? 0 : (uint32_t)(*budget / 1000000);
         if (wait_ms > LINK_DRAW_MS) wait_ms = LINK_DRAW_MS;
         linking = wait_ms != 0;
         if (!wait_ms) budget = NULL;
@@ -4221,9 +4254,16 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
             if (linking) t0 = kern_now_ns();
             else w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;
             vk_exec_ahead(ex);
+            // The fast link's wait is one for each pipeline, counted from its first miss (link_budget): what that left
+            // unbuilt is a compile, and its later draws, in this frame and the next ones, wait for nothing.
+            double building = wait_ms && linking ? vk_pipeline_building_ms(&s) : 0;
+            if (wait_ms && linking) {
+                uint32_t left = building >= LINK_DRAW_MS ? 0 : LINK_DRAW_MS - (uint32_t)building;
+                if (wait_ms > left) wait_ms = left;
+            }
             // A mesh pipeline that is known to be compiling gets no fast link, so the few milliseconds a draw waits
             // for one are lost in every frame that meets it until the compile ends, 0.2 to 1.1 s later (MESH_WAIT_MS).
-            if (wait_ms && linking && mesh && !fb && vk_pipeline_building_ms(&s) > MESH_WAIT_MS) wait_ms = 0;
+            if (wait_ms && linking && mesh && !fb && building > MESH_WAIT_MS) wait_ms = 0;
             if (wait_ms) p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
         }
         if (t0 && budget) {

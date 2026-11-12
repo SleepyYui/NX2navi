@@ -550,6 +550,10 @@ int vk_exec_in_chunk(void);   // the calling thread records a chunk of a paralle
 // waits until the group's first chunk ran the pass hooks.
 int vk_exec_shared(void);
 int vk_exec_behind(void);
+// The replay thread, while no group of the replay workers is out (vk_exec.c "side work"): fn(arg, lo, hi) over items
+// [0, n) in slices of grain, on the workers and the calling thread at once; returns when every slice is done. Without
+// workers, or for one slice, the caller runs it alone.
+void vk_exec_par(void (*fn)(void *arg, int lo, int hi), void *arg, int n, int grain);
 void vk_exec_hooks_wait(void);
 // A pass hook (vk_contact_pass_begin, vk_dlaa_pass) about to change what draws read or to record: the submitting
 // thread past a group waits for the group first; a group's hooks run in its first chunk, in turn already.

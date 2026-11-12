@@ -264,15 +264,39 @@ static void summary(void) {
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
 }
 
-// The bytes of regions reg[0..nreg) (total bytes in all) into a's device copy, through its host copy with DLSS.
-static void copy_regions(Arena *a, const Reg *reg, int nreg, uint64_t total) {
+// copy_regions's work, sliced for the replay workers (vk_exec_par): regions of the game's memory into the arena, then
+// the host copy into the device copy in COPY_SLICE pieces.
+#define COPY_SLICE (64u << 10)
+typedef struct { uint8_t *dst, *map; const Reg *reg; uint64_t total; } CopyJob;
+static void copy_some(void *arg, int lo, int hi) {
+    const CopyJob *j = arg;
+    for (int i = lo; i < hi; i++)
+        memcpy(j->dst + j->reg[i].off, (const void *)(uintptr_t)j->reg[i].lo, j->reg[i].hi - j->reg[i].lo);
+}
+static void copy_down(void *arg, int lo, int hi) {
+    const CopyJob *j = arg;
+    uint64_t a = (uint64_t)lo * COPY_SLICE, b = (uint64_t)hi * COPY_SLICE;
+    if (b > j->total) b = j->total;
+    memcpy(j->map + a, j->dst + a, b - a);
+}
+
+// The bytes of regions reg[0..nreg) (total bytes in all) into a's device copy, through its host copy with DLSS. With
+// par (the replay thread at a submission's start), split over the replay workers: about 700 regions and 0.7 MiB in
+// Hyrule Field, half a millisecond of the submitting thread's time on one thread.
+static void copy_regions(Arena *a, const Reg *reg, int nreg, uint64_t total, int par) {
     uint8_t *dst = a->map;
     if (vk_dlaa_available()) {
         if (!a->cpu && !(a->cpu = malloc(a->size))) rt_fatal("vk_usnap: out of memory");
         dst = a->cpu;
     }
-    for (int i = 0; i < nreg; i++) memcpy(dst + reg[i].off, (const void *)(uintptr_t)reg[i].lo, reg[i].hi - reg[i].lo);
-    if (dst != a->map) memcpy(a->map, dst, total);   // one sequential write into the device copy
+    CopyJob j = {dst, a->map, reg, total};
+    if (par) vk_exec_par(copy_some, &j, nreg, 48);
+    else copy_some(&j, 0, nreg);
+    if (dst != a->map) {   // sequential writes into the device copy
+        int slices = (int)((total + COPY_SLICE - 1) / COPY_SLICE);
+        if (par) vk_exec_par(copy_down, &j, slices, 2);
+        else copy_down(&j, 0, slices);
+    }
     vmaFlushAllocation(vk_ctx()->vma, a->alloc, 0, total);   // a no-op on coherent memory
 }
 
@@ -307,7 +331,7 @@ void vk_usnap_take(const uint64_t *handles, int n) {
         t->total += (hi - lo + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     }
     plat_mutex_unlock(&gather_lock);
-    if (t->nreg && (t->arena = arena_get(t->total))) copy_regions(t->arena, t->reg, t->nreg, t->total);
+    if (t->nreg && (t->arena = arena_get(t->total))) copy_regions(t->arena, t->reg, t->nreg, t->total, 0);
     t->ns = kern_now_ns() - t0;
     plat_mutex_lock(&tq_lock);
     if (tq_tail) tq_tail->next = t;
@@ -393,7 +417,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     plat_mutex_unlock(&gather_lock);
     if (!U.nreg) return;
     if (!(U.arena = arena_get(total))) return;
-    copy_regions(U.arena, U.reg, U.nreg, total);
+    copy_regions(U.arena, U.reg, U.nreg, total, 1);   // the replay thread at the submission's start
     U.on = 1;
     U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += total, U.copy_ns += kern_now_ns() - t0;
 }

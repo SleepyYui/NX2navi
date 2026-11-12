@@ -500,6 +500,28 @@ static int same_but_swizzle(const TexKey *a, const TexKey *b) {
     return !memcmp(&x, &y, sizeof x);
 }
 
+// Whether a slot (key k) may follow entry p, another descriptor at the same storage, when the slot's own entry is
+// released (slot_resolve). Ocarina's per-frame render targets share storage, so the live entry at an address is often
+// a target of another size that the frame laid out there: an effect's 1130x86 strip over the 480x270 half-size
+// lighting term at a 1280x720 scene. Followed, the compute pass that writes the term and the full-screen pass that
+// reads it both got the strip's image, the term read back as zero over most of the screen and a jump attack's hit
+// effect drew the right 44% of the scene black. A slot follows only an entry of its own size; block-compressed
+// formats are left out of the test, as a GPU encoder renders their blocks through a smaller uncompressed view of the
+// same storage. Counted in n_follow_refused.
+static uint64_t n_follow_refused;
+static int follow_size_ok(const Tex *p, const TexKey *k) {
+    int bw1 = 1, bh1 = 1, bw2 = 1, bh2 = 1;
+    nvn_fmt_bpb(p->key.d.format, &bw1, &bh1);
+    nvn_fmt_bpb(k->d.format, &bw2, &bh2);
+    if (bw1 > 1 || bh1 > 1 || bw2 > 1 || bh2 > 1) return 1;
+    if (p->key.d.width == k->d.width && p->key.d.height == k->d.height && p->key.d.depth == k->d.depth) return 1;
+    if (n_follow_refused++ < 8)
+        rt_log("vk: a texture slot at %#llx (%ux%u format %#x) did not follow a %ux%u texture at the same storage: "
+               "its own image instead", (unsigned long long)k->addr, k->d.width, k->d.height, k->d.format,
+               p->key.d.width, p->key.d.height);
+    return 0;
+}
+
 // Textures whose content the CPU provides in pool memory. Display, compressible, zcull,
 // depth, multisample and GPU-only storage stays GPU-owned.
 // mirror_refused: NULL for such a texture, else the rule that leaves it out, in words for a log line.
@@ -1952,12 +1974,10 @@ static int others_at(char *out, size_t n, const Tex *e, const Tex *skip) {
 // the others is bounded by NX2NAVI_TEX_RELEASED_MB (drop_stale).
 // Each call looks at up to SWEEP_LOOK entries from where the last one stopped (sweep_at; rel_unlink moves it off an
 // entry that leaves): with thousands of entries that stay, a walk from the head at every release would cross them all.
-#define RELEASED_MAX_DEFAULT 2048
+// RELEASED_MAX is the floor of that limit; released_max raises it by the card (NX2NAVI_TEX_RELEASED_MAX sets it).
+#define RELEASED_MAX 2048
+#define RELEASED_MAX_TOP 8192
 #define RELEASED_HARD 16384
-// NX2NAVI_TEX_RELEASED_MAX (test; default RELEASED_MAX_DEFAULT): the count from which released entries are swept, so a
-// short run reaches the sweep a long session reaches after minutes.
-static int released_max_v = -1;
-#define RELEASED_MAX (released_max_v)
 #define SWEEP_LOOK 64
 #define SWEEP_UNSAMPLED PRESENTS(120)
 
@@ -1965,19 +1985,37 @@ static int comes_back_intact(const Tex *e);
 
 static uint64_t stale_after(const Tex *e);
 
-static void sweep_released(void) {
-    if (released_max_v < 0) {
-        const char *t = cfg_get("NX2NAVI_TEX_RELEASED_MAX");
-        int v = t && *t ? atoi(t) : 0;
-        released_max_v = v > 0 ? v : RELEASED_MAX_DEFAULT;
-        if (v > 0) rt_log("vk: released textures are swept from %d on (NX2NAVI_TEX_RELEASED_MAX, a test)", v);
+// The limit of released entries past which the sweep drops those that lose nothing: one per 2 MiB of the video memory
+// budget, from RELEASED_MAX to RELEASED_MAX_TOP. In Castle Town market on a 16 GB card (RTX 5060 Ti) with 2048 the
+// sweep dropped 412 entries in a session and a few textures blinked black for a moment; with 8192 (and
+// NX2NAVI_TEX_RELEASED_MB = 4096) it dropped none, 6,863 were kept and none blinked. Their memory stays bounded by
+// NX2NAVI_TEX_RELEASED_MB and the VRAM pressure. Read once the budget is known.
+static int released_max(void) {
+    static int max;
+    if (max) return max;
+    const char *s = cfg_get("NX2NAVI_TEX_RELEASED_MAX");
+    if (s && *s) {
+        long long n = atoll(s);
+        max = n < 1 ? 1 : n > RELEASED_HARD ? RELEASED_HARD : (int)n;
+    } else {
+        uint64_t vused = 0, vbudget = 0;
+        int exact = 0;
+        if (!vk_mem_vram(&vused, &vbudget, &exact) || !vbudget) return RELEASED_MAX;
+        long long n = (long long)(vbudget >> 21);
+        max = n < RELEASED_MAX ? RELEASED_MAX : n > RELEASED_MAX_TOP ? RELEASED_MAX_TOP : (int)n;
     }
-    if (nreleased <= RELEASED_MAX) return;
+    rt_log("vk: released textures: the sweep keeps up to %d entries (NX2NAVI_TEX_RELEASED_MAX)", max);
+    return max;
+}
+
+static void sweep_released(void) {
+    int lim = released_max();
+    if (nreleased <= lim) return;
     {
         uint64_t now = frames_now();
         const uint64_t stale = PRESENTS(120);   // STALE_FRAMES, defined below
         Tex *e = sweep_at ? sweep_at : rel_head;
-        for (int n = 0; n < SWEEP_LOOK && nreleased > RELEASED_MAX; n++) {
+        for (int n = 0; n < SWEEP_LOOK && nreleased > lim; n++) {
             if (!e || now - e->rel_frame < stale) { e = rel_head; break; }   // the rest is younger: from the oldest again
             Tex *next = e->rel_next;
             // an entry the game took back before waits out GAP_TIMES the longest of those releases (stale_after)
@@ -4129,7 +4167,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
             // With the target kept they get the volume itself.
             if (p->key.d.target != k.d.target) continue;
             if (same_but_swizzle(&p->key, &k) && (!cpu_slot || !s->finalized || alias_has_gpu_content(p))) { e = p; break; }
-            if (!any && (!cpu_slot || alias_has_gpu_content(p))) any = p;
+            if (!any && (!cpu_slot || alias_has_gpu_content(p)) && follow_size_ok(p, &k)) any = p;
         }
         // A finalized CPU descriptor must not recreate its image from freed storage. The slot keeps this state even
         // after its released image was evicted; registering the descriptor again makes it current. While its own

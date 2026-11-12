@@ -488,6 +488,7 @@ static struct {
     int failed, reset;
     uint64_t evals, frames_missed;
     int share_off;   // frames left that pick the output pass without the mode's share (vk_dlaa_pass, vk_dlaa_frame)
+    int shape_logged;   // passes of another shape than the scene's turned down as the output pass (vk_dlaa_pass)
     // jitter (vk_dlaa_viewport)
     VkImage jdepth;              // the scene depth of the last frame DLAA ran on: passes drawing with it are jittered
     uint32_t jw, jh;             // its size: on Ocarina's frame the camera's draws into any D32F depth of it are (jitter_draw)
@@ -527,6 +528,9 @@ static struct {
     uint64_t cam_none_draw, cam_none_snap;   // no scene-context draw this frame / one, not in the evaluating submission's copy
     uint64_t cam_at_draw;        // camera taken from the bytes the draw read, where the evaluating submission lacks them
     uint64_t cam_kept, cam_kept_max;   // no camera, history kept with zero motion / runs cut short at KEEP_MAX
+    float cut_pos[3], cut_fwd[3];      // last frame's camera position and direction (cam_cut)
+    uint64_t cut_ns, cuts;             // when it was read; camera cuts that started a new history
+    int cut_ok, cut_logged;
     int keep_run;                // frames in a row kept without a camera
     uint64_t gap_logged, miss_logged, target_logged, second_logged;
     uint64_t seq_present;        // vk_exec_submit_seq at the last present (vk_dlaa_frame)
@@ -615,7 +619,10 @@ int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, i
     if (!D.fg_fresh || D.failed) return 0;
     D.fg_fresh = 0;
     if (!fg_current(D.fg_at)) return 0;
-    *depth = D.fg_depth, *mv = D.fg_mv, *jx = D.fg_jx, *jy = D.fg_jy, *reset = 0;
+    // reset: DLSS started a new history on this frame (evaluate). Handed out as 0 before, so frame generation was never
+    // told of a camera cut, another scene size or another target, and interpolated across them: an area load
+    // generated frames between two unrelated pictures.
+    *depth = D.fg_depth, *mv = D.fg_mv, *jx = D.fg_jx, *jy = D.fg_jy, *reset = D.fg_reset;
     return 1;
 }
 
@@ -1058,6 +1065,45 @@ static void cam_note(int view, int kept) {
                                                  : "new history");
 }
 
+// Camera cuts (NX2NAVI_DLAA_CUT, default 1; 0: off). Only a lost camera (mv_pass), another scene size or another
+// target started a new history, so DLSS and frame generation (vk_dlaa_fg_inputs) carried their history across a camera
+// that jumped: an area load or a spawn moves it 5 to 180 m in one frame. Such a frame now starts a new history, as
+// NVIDIA's DLSS guide asks for a camera cut: a move over 5 m, or a turn over 10 degrees together with a move over 0.5 m,
+// both per 60 Hz frame and scaled by the time since the last camera. Camera traces of play in the Fire Temple
+// (NX2NAVI_MOUSE_TRACE) had a median of 0.05 m and 0.08 degrees a frame; the second test took only the area loads and a
+// swing of the camera through a doorway at 12 to 18 degrees and 0.7 to 1.4 m a frame. A turn alone (the mouse camera,
+// which orbits about 3 m from Link) does not count. Each cut is logged, up to 24.
+// v: the Ocarina scene context's rows 0-2, the view (fg_camera).
+static void cam_cut(const float *v) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("DLAA_CUT", "1");
+    float pos[3], fwd[3];
+    for (int i = 0; i < 3; i++) {
+        fwd[i] = -v[8 + i];
+        pos[i] = -(v[i] * v[3] + v[4 + i] * v[7] + v[8 + i] * v[11]);
+    }
+    uint64_t now = plat_now_ns();
+    if (on && D.cut_ok) {
+        double dot = fwd[0] * D.cut_fwd[0] + fwd[1] * D.cut_fwd[1] + fwd[2] * D.cut_fwd[2];
+        double turn = acos(dot > 1 ? 1 : dot < -1 ? -1 : dot) * (180.0 / 3.14159265358979);
+        double dx = pos[0] - D.cut_pos[0], dy = pos[1] - D.cut_pos[1], dz = pos[2] - D.cut_pos[2];
+        double move = sqrt(dx * dx + dy * dy + dz * dz);
+        double k = (now - D.cut_ns) / 1e6 / (1000.0 / 60);   // 60 Hz frames since the last camera
+        if (k < 0.25) k = 0.25;
+        if (k > 4) k = 4;
+        if (move > 5.0 * k || (turn > 10.0 * k && move > 0.5 * k)) {
+            D.reset = 1, D.cuts++;
+            if (D.cut_logged < 24)
+                D.cut_logged++, rt_log("dlaa: frame %llu: camera cut (moved %.2f m, turned %.1f degrees in %.1f ms): new "
+                                       "history (%llu so far)",
+                                       (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1,
+                                       move, turn, (now - D.cut_ns) / 1e6, (unsigned long long)D.cuts);
+        }
+    }
+    memcpy(D.cut_pos, pos, sizeof pos), memcpy(D.cut_fwd, fwd, sizeof fwd);
+    D.cut_ns = now, D.cut_ok = 1;
+}
+
 // The pass, recorded through the recorder like the replay's own commands. 0: no camera this frame (the vectors stay
 // zero and DLSS starts a new history); 2: no camera, but the history is kept (the vectors stay zero, dlaa_cam_keep).
 // bias > 0 with this frame's G-buffer classes (D.ids) also writes e->mask, the bias mask (dlaa_mv.comp); *masked says
@@ -1125,6 +1171,7 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     }
     D.fg_cam_ok = 0;
     if (cr && have_m && D.cam_size == OCAM_BLOCK) fg_camera(cr, m);
+    if (cr && D.cam_size == OCAM_BLOCK) cam_cut(cr);
     int s = D.cam_slot, had_prev = D.cam_prev_ok;
     if (D.cam_size == CAM_BLOCK) {   // the whole block, for the per-object motion pass (the deferred engine's only)
         VkBufferCopy bc = {cam.offset, (VkDeviceSize)s * CAM_SLOT, CAM_BLOCK};
@@ -1769,6 +1816,40 @@ static void release_kept(const struct Size *making, int all) {
                   making->w, making->h, all ? "after a release" : "larger inputs");
 }
 
+// The scene's last column and row after a jitter to the left or up. The jitter moves the scene's viewport by under half a
+// pixel (vk_dlaa_viewport), which keeps every pixel centre inside it, yet on an RX 7900 XT (AMD's Windows driver) the
+// draws of a viewport moved left left the last column out, and of one moved up the last row: the driver evidently limits
+// drawing to the whole pixels inside the viewport. In a frame dump (NX2NAVI_DUMP, Hyrule Field, 3416x1440, FSR 4 Native
+// AA) the depth's last row kept its clear value through every scene pass and the light target held the fog's colour
+// there, which the upscaler blended into a grey line along the bottom and right edges of the picture that flickered with
+// the jitter; with NX2NAVI_DLAA_JITTER=0, and without DLSS or FSR, there was no line. Before DLSS or FSR reads the scene,
+// such a column or row of the light target and of the depth (which the motion vectors are made from) is filled from the
+// one next to it. NX2NAVI_DLAA_EDGE_FILL=0 (test): not filled.
+static void edge_fill(VkCommandBuffer cb, const VkExecTarget *t, const VkExecTarget *z, float jx, float jy) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("DLAA_EDGE_FILL", "1");
+    uint32_t w = t->width, h = t->height;
+    if (!on || w < 2 || h < 2 || (jx >= 0 && jy >= 0)) return;
+    static int told;
+    if (!told++) rt_log("dlaa: the scene's last column or row after a jitter to the left or up is filled from the one before it");
+    // the column first, then the row over the whole width, so the corner comes from the filled column
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass ? jy >= 0 : jx >= 0) continue;
+        VkOffset3D from = pass ? (VkOffset3D){0, (int32_t)h - 2, 0} : (VkOffset3D){(int32_t)w - 2, 0, 0};
+        VkOffset3D to = pass ? (VkOffset3D){0, (int32_t)h - 1, 0} : (VkOffset3D){(int32_t)w - 1, 0, 0};
+        VkExtent3D ext = pass ? (VkExtent3D){w, 1, 1} : (VkExtent3D){1, h, 1};
+        for (int i = 0; i < 2; i++) {
+            const VkExecTarget *g = i ? z : t;
+            if (!g->image || g->width != w || g->height != h) continue;
+            VkImageAspectFlags a = i ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+            VkImageCopy r = {.srcSubresource = {a, g->level, g->base_layer, 1}, .srcOffset = from,
+                             .dstSubresource = {a, g->level, g->base_layer, 1}, .dstOffset = to, .extent = ext};
+            vkCmdCopyImage(cb, g->image, VK_IMAGE_LAYOUT_GENERAL, g->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        }
+        full_barrier(cb);
+    }
+}
+
 // Set when the scene the upscaler runs on has another size than the last one; vk_dlaa_resized_take reads it.
 static volatile int32_t size_changed;
 
@@ -1799,6 +1880,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     VkImageView zv = vk_exec_target_view(z->img, z->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, z->level,
                                          z->base_layer, 1, 0);
     float jx = D.jit_used ? D.ux : 0.0f, jy = D.jit_used ? D.uy : 0.0f;
+    edge_fill(cb, t, z, jx, jy);   // before the motion vectors read the depth
     static int no_mv = -1;
     if (no_mv < 0) no_mv = !rt_knob("DLAA_MV", "1");   // NX2NAVI_DLAA_MV=0: zero motion (test)
     int masked = 0, mv = no_mv ? 0 : mv_pass(ex, e, zv, jx, jy, char_bias(), &masked);
@@ -1908,6 +1990,9 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     if (!NGX_OK(r)) return dl_fail("DLSS evaluation", r);
 evaluated:
     if (timed) times_mark(cb, T_DL1);   // through the recorder, after NGX's own commands
+    // Frame generation gets the same new start with this frame's inputs (vk_dlaa_fg_inputs): a frame DLSS starts a
+    // new history on (a camera cut, another scene size or target) has no motion from the frame before that holds.
+    D.fg_reset = D.reset;
     D.reset = 0;
     D.last = e, e->used = D.evals + 1;
     if (D.evals % 600 == 0) query_vram();
@@ -2109,7 +2194,18 @@ void vk_dlaa_pass(VkExec *ex) {
         int native = share <= 0 || share >= 1;   // no upscaling share: the scene is as large as the picture
         int big = D.share_off || native || c->width >= 0.95 * D.color.width / share;
         int same = c->width == D.color.width && c->height == D.color.height;
-        if (one && big && c->width > D.color.width && c->height > D.color.height) {
+        // The output pass has the scene's shape: the game redraws its 2000x2000 area map into an RGBA8 target of its
+        // own on a room change and on the pause menu, one colour target and no depth, larger than the scene both ways.
+        // Taken for the output pass, DLSS wrote the game's picture into the map, and the minimap showed that picture
+        // behind its room shapes until the pause menu drew the map again. A pass whose width over height is more than
+        // 3% from the scene's (sizes round to multiples of 8) is not the output; the ultrawide sets widen the scene
+        // with the picture, so their output pass still matches.
+        int shape = (double)c->width * D.color.height <= 1.03 * (double)c->height * D.color.width &&
+                    (double)c->height * D.color.width <= 1.03 * (double)c->width * D.color.height;
+        if (one && !shape && big && c->width > D.color.width && c->height > D.color.height && D.shape_logged < 8)
+            D.shape_logged++, rt_log("dlaa: a %ux%u pass is not the output pass: its shape is not the scene's %ux%u",
+                                     c->width, c->height, D.color.width, D.color.height);
+        if (one && shape && big && c->width > D.color.width && c->height > D.color.height) {
             // DLSS runs: the replay workers' draws read the jitter and its end, and list the per-object motion it
             // takes (vk_exec.c "replay workers"); the G-buffer and the arming above change nothing they read
             vk_exec_hook_turn();

@@ -278,6 +278,9 @@ class Job:
     def ensure_tools(self, sid):
         layout = self.ctx.layout
         self.begin(sid)
+        missing = toolchain.zstd_missing(layout)
+        if missing:
+            raise toolchain.ToolchainError(missing)
         lock = toolchain.load_lock(layout, self.ctx.version)
         if toolchain.is_current(layout, lock):
             have_tools = True
@@ -433,6 +436,16 @@ class ExportJob(Job):
         self.out = game_export.export(self.game_dir, self.out, minimal=self.minimal,
                                       progress=progress, cancel=self.cancelled)
         self.finish('export')
+
+class ModsRebuildJob(RebuildJob):
+    """Play with a mod whose code cheats or ExeFS patches the game was not built with (launcher/mods.py
+    code_waiting): the game is built again with them, compiling only what they change, and then starts (App.play)."""
+    title = 'Building Your Mods In'
+    retune = False
+
+    def __init__(self, ctx, game_dir):
+        super().__init__(ctx, game_dir)
+        self.after = 'play'
 
 
 class UpdateDownloadJob(Job):

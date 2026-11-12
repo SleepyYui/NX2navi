@@ -498,6 +498,19 @@ class UninstallTest(Tmp):
 # ---------------------------------------------------------------- toolchain
 
 class ToolchainTest(Tmp):
+    def test_zstd_missing(self):
+        """A Python without compression.zstd and zstandard is named at startup, with the pip line for a checkout."""
+        with mock.patch.dict(sys.modules, {'compression.zstd': None, 'zstandard': mock.MagicMock()}):
+            self.assertEqual(toolchain.zstd_missing(self.layout), '')
+        with mock.patch.dict(sys.modules, {'compression.zstd': None, 'zstandard': None}):
+            msg = toolchain.zstd_missing(self.layout)
+            ctx = Context(self.layout)
+        self.assertIn('zstandard', msg)
+        self.assertIn('-m pip install -r', msg)
+        self.assertIn('requirements-launcher.txt', msg)
+        self.assertEqual(ctx.zstd_missing, msg)
+        self.assertTrue(any(msg in line for line in ctx.log_tail()))
+
     def test_resolve_and_install(self):
         repo = self.tmp / 'repo'
         repo.mkdir()
@@ -1863,7 +1876,8 @@ class MakeGameTest(Tmp):
     def test_shaders_key_names_the_translator_the_build_uses(self):
         """A source checkout has its translator in build/xlate/ (tools/build_xlate.py), not in the kit's bin/: the
         shaders key follows its identity, so a rebuilt translator prepares the shaders again. A kit's bin/ comes first
-        when both exist, and a kit with no translator is refused with the way to build one."""
+        when both exist. A kit with no translator has a key that says so (the keys are worked out before the steps
+        run, steps_to_run), and the build refuses it with the way to build one when it needs the translator."""
         from unittest import mock
         kit = self.tmp / 'kit'
         (kit / 'tools').mkdir(parents=True)
@@ -1887,8 +1901,9 @@ class MakeGameTest(Tmp):
             self.assertEqual(key(), from_bin)
             shutil.rmtree(kit / 'bin')
             shutil.rmtree(xlate)
+            self.assertTrue(key().endswith('|missing'))
             with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
-                key()
+                self.mg.xlate_source()
             self.assertIn('tools/build_xlate.py', err.getvalue())
 
     def test_prompts_step(self):
@@ -1958,12 +1973,13 @@ class MakeGameTest(Tmp):
             self.assertEqual(build()[2], 3)
             (art / 'T_X_B_White.png').write_bytes(b'picture two')
             self.assertEqual(build()[2], 4)
-            # the lift running again makes the compile and the shaders run, not the prompts
+            # the lift running again makes the compile run, not the shaders (their key names the lift and the
+            # compile they depend on, make_game.py UNAFFECTED) nor the prompts
             st = json.loads((self.out / 'build-cache' / 'state.json').read_text())
             del st['steps']['lift']
             (self.out / 'build-cache' / 'state.json').write_text(json.dumps(st))
             others, ev, runs = build()
-            self.assertEqual((others, states(ev), runs), (['compile', 'lift', 'shaders'], ['skip'], 4))
+            self.assertEqual((others, states(ev), runs), (['compile', 'lift'], ['skip'], 4))
             # a kit without art: skipped, the folders an earlier build drew stay
             shutil.rmtree(kit / 'prompt-art')
             self.assertEqual(build(), ([], [{'ev': 'step', 'step': 'prompts', 'state': 'skip'}], 4))
@@ -3086,7 +3102,8 @@ class MakeGameTest(Tmp):
         code, _ = self.main_rebuild(lambda out, cache: None, stop)
         self.assertEqual(code, 1)
         st = json.loads((self.out / 'build-cache' / 'state.json').read_text())
-        self.assertEqual(sorted(st['steps']), ['exefs', 'lift', 'romfs'])
+        # the shaders' record stays as the lift left it: the step's key names what it depends on (UNAFFECTED)
+        self.assertEqual(sorted(s for s in st['steps'] if s != 'shaders'), ['exefs', 'lift', 'romfs'])
         self.assertEqual(build.built_version(self.out), '')   # no finished build on record
         self.assertTrue(build.can_rebuild(self.out))
         self.assertTrue(build.installed(self.out))
@@ -4806,7 +4823,143 @@ class WindowTest(Tmp):
         r = subprocess.run([sys.executable, '-m', 'launcher', '--root', str(self.tmp / 'w'), '--selftest'],
                            cwd=ROOT, capture_output=True, text=True, timeout=180)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('16 screens drawn', r.stdout)
+        self.assertIn('19 screens drawn', r.stdout)
+
+
+# ---------------------------------------------------------------- mods
+
+class ModsTest(Tmp):
+    """The mods folder as the launcher puts it in order for the game (launcher/mods.py) and the build takes its code
+    in (tools/make_game.py, tools/mod_files.py)."""
+
+    def setUp(self):
+        super().setUp()
+        from launcher import mods
+        self.mods = mods
+        self.game = self.tmp / 'game'
+        made_up_game(self.game)
+        self.folder = self.game / 'mods'
+        self.folder.mkdir()
+
+    def file(self, rel, text='x'):
+        p = self.folder / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+        return p
+
+    def tree(self):
+        return sorted(p.relative_to(self.folder).as_posix() for p in self.folder.rglob('*') if p.is_file())
+
+    def test_downloads_are_put_where_the_game_looks(self):
+        with zipfile.ZipFile(self.folder / 'Zipped.zip', 'w') as z:   # a zip holding the mod's own folder
+            z.writestr('Zipped/romfs/Actor/a.bfres', 'a')
+            z.writestr('Zipped/README.md', 'r')
+        with zipfile.ZipFile(self.folder / 'Escape.zip', 'w') as z:
+            z.writestr('../outside.txt', 'e')
+        self.file('Wrapped/readme.txt')                                # wrapped twice, a readme on each level
+        self.file('Wrapped/Wrapped v2/readme.txt')
+        self.file('Wrapped/Wrapped v2/Wrapped/romfs/UI/b.txt')
+        self.file('romfs/Actor/c.bfres')                               # a mod's romfs straight in the mods folder
+        self.file('atmosphere/contents/0400486024DEC000/romfs/d.txt')  # an Atmosphere layout: a mod as it is
+        self.file('Options/Option A/romfs/e')                           # a download with options: left alone
+        self.file('Options/Option B/romfs/e')
+        done = self.mods.prepare(self.game)
+        self.assertEqual(self.tree(), [
+            'Escape.zip', 'Options/Option A/romfs/e', 'Options/Option B/romfs/e', 'Unnamed mod/romfs/Actor/c.bfres',
+            'Wrapped/readme (2).txt', 'Wrapped/readme.txt', 'Wrapped/romfs/UI/b.txt', 'Zipped.zip',
+            'Zipped/README.md', 'Zipped/romfs/Actor/a.bfres',
+            'atmosphere/contents/0400486024DEC000/romfs/d.txt'])
+        self.assertFalse((self.game / 'outside.txt').exists())
+        self.assertTrue(any(line.startswith('Escape.zip was not unpacked') for line in done))
+        self.assertEqual(self.mods.prepare(self.game), [line for line in done if 'Escape.zip' in line])   # once
+        found = {m.name: m for m in self.mods.scan(self.game)}
+        self.assertEqual(sorted(n for n, m in found.items() if m.usable),
+                         ['Unnamed mod', 'Wrapped', 'Zipped', 'atmosphere'])
+        self.assertIn('options', found['Options'].problem)
+        self.assertEqual(found['Zipped'].files, ['actor/a.bfres'])
+
+    def test_what_the_game_cannot_use_is_named(self):
+        self.file('Plugin/exefs/subsdk9')
+        self.file('Other/atmosphere/contents/01007EF00011E000/romfs/x')
+        self.file('Readme only/readme.txt')
+        self.file('Old patch/exefs/0123456789ABCDEF0123456789ABCDEF.ips', 'PATCHEOF')
+        self.file('Patch/exefs/E0F3CCFAF50065AE4EA01EB5AEB13B1A.ips', 'PATCHEOF')
+        found = {m.name: m for m in self.mods.scan(self.game)}
+        self.assertIn('code module', found['Plugin'].problem)
+        self.assertIn('01007EF00011E000', found['Other'].problem)
+        self.assertIn('nothing the game reads', found['Readme only'].problem)
+        self.assertIn('another version', found['Old patch'].problem)
+        self.assertEqual((found['Patch'].problem, found['Patch'].patches), ('', 1))
+
+    def test_switches_and_order_are_the_games_settings(self):
+        for name in ('beta', 'Alpha', ' Lead'):
+            self.file(f'{name}/romfs/same.txt', name)
+        self.assertEqual([m.name for m in self.mods.scan(self.game)], [' Lead', 'Alpha', 'beta'])   # strcmp
+        self.mods.set_enabled(self.game, 'Alpha', False)
+        self.mods.move(self.game, 'beta', -2)
+        self.mods.set_enabled(self.game, ' Lead', False)
+        self.mods.set_enabled(self.game, 'Alpha', True)
+        self.assertEqual(gameini.get(self.game, 'MODS_ORDER'), 'beta| Lead|Alpha')
+        self.assertEqual(gameini.get(self.game, 'MODS_DISABLED'), ' Lead')
+        self.assertIn('mods_disabled = " Lead"', (self.game / 'nx2navi.ini').read_text())   # as runtime/cfg.c quotes
+        found = self.mods.scan(self.game)
+        self.assertEqual([(m.name, m.enabled) for m in found], [('beta', True), (' Lead', False), ('Alpha', True)])
+        self.assertEqual(self.mods.overlaps(found), {'beta': [('Alpha', 1, True)], 'Alpha': [('beta', 1, False)]})
+
+    def test_a_picked_archive_or_folder_is_added(self):
+        src = self.tmp / 'Downloads'
+        src.mkdir()
+        with zipfile.ZipFile(src / 'Picked.zip', 'w') as z:
+            z.writestr('romfs/a.txt', 'a')
+        (src / 'Folder Mod' / 'Inner' / 'exefs').mkdir(parents=True)
+        (src / 'Folder Mod' / 'Inner' / 'exefs' / 'E0F3CCFAF50065AE.ips').write_text('PATCHEOF')
+        (src / 'romfs').mkdir()
+        (src / 'romfs' / 'b.txt').write_text('b')
+        self.assertEqual(self.mods.add(self.game, src / 'Picked.zip').name, 'Picked')
+        self.assertEqual(self.mods.add(self.game, src / 'Picked.zip').name, 'Picked 2')
+        self.assertEqual(self.mods.add(self.game, src / 'Folder Mod').name, 'Folder Mod')
+        self.assertEqual(self.mods.add(self.game, src / 'romfs').name, 'Unnamed mod')
+        self.assertEqual(self.tree(), ['Folder Mod/exefs/E0F3CCFAF50065AE.ips', 'Picked 2/romfs/a.txt',
+                                       'Picked/romfs/a.txt', 'Unnamed mod/romfs/b.txt'])
+        self.assertTrue((src / 'Picked.zip').is_file())   # the player's download stays where it was
+        with self.assertRaises(self.mods.ModError):
+            self.mods.add(self.game, src / 'Folder Mod' / 'Inner' / 'exefs' / 'E0F3CCFAF50065AE.ips')
+
+    def test_code_waits_for_a_build_that_saw_it(self):
+        import make_game
+        cheat = self.file('Cheats/cheats/E0F3CCFAF50065AE.txt', '[Moon jump]\n04000000 00000000 D503201F\n')
+        self.file('Textures/romfs/a.txt')
+        self.assertEqual(self.mods.code_waiting(self.game), ['Cheats'])
+        self.mods.set_enabled(self.game, 'Cheats', False)
+        self.assertEqual(self.mods.code_waiting(self.game), [])          # a mod switched off waits for nothing
+        self.mods.set_enabled(self.game, 'Cheats', True)
+        (self.game / 'build-cache' / 'mod-code.json').write_text(json.dumps(make_game.mod_code(self.game)))
+        self.assertEqual(self.mods.code_waiting(self.game), [])          # the last build took it up
+        cheat.write_text('[Moon jump]\n04000000 00000000 D65F03C0\n')
+        self.assertEqual(self.mods.code_waiting(self.game), ['Cheats'])  # edited since
+
+    def test_the_mods_code_is_in_the_lift_key_and_not_the_shaders_key(self):
+        import make_game
+        kit = self.tmp / 'kit'
+        for d in ('tools', 'recomp', 'runtime', 'bin'):
+            (kit / d).mkdir(parents=True)
+        for f in ('tools/prepare_shaders.py', 'tools/cheats.py', 'tools/exefs_patches.py', 'tools/mod_files.py',
+                  'recomp/patches-v111.txt', 'bin/' + make_game.XLATE_NAME, 'bin/nx2navi_xlate.id', 'VERSION'):
+            (kit / f).write_text('1\n')
+
+        def keys():
+            return {s: make_game.step_key(s, 'game', self.game) for s in ('lift', 'compile', 'shaders')}
+        with mock.patch.object(make_game, 'KIT', kit):
+            plain = keys()
+            self.file('Textures/romfs/a.txt')
+            self.assertEqual(keys(), plain)                    # files of the game's data: no build
+            self.assertNotIn('|mods ', plain['lift'])
+            self.file('Patch/exefs/E0F3CCFAF50065AE.ips', 'PATCHEOF')
+            with_patch = keys()
+            self.assertTrue(with_patch['lift'].startswith(plain['lift'] + '|mods '))
+            self.assertNotEqual(with_patch['compile'], plain['compile'])
+            self.assertEqual(with_patch['shaders'], plain['shaders'])
+            self.assertEqual(list(make_game.mod_code(self.game)), ['Patch/exefs/E0F3CCFAF50065AE.ips'])
 
 
 if __name__ == '__main__':

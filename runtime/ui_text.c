@@ -154,14 +154,16 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_AA] = "Anti-aliasing",
     [UI_MENU_AA_DESC] = "How the edges of the 3D picture are smoothed. Game SMAA is the game's own, as on the console. Off "
                         "leaves the edges as drawn. FXAA is quick and a little soft. SMAA finds more of the edges than the "
-                        "game's and keeps detail sharp. TAA is DLSS or FSR 3.1 at full size: the steadiest edges in motion; "
-                        "it sets the upscaler. Takes effect at once.",
+                        "game's and keeps detail sharp. TAA is DLSS or FSR at full size: the steadiest edges in motion; it "
+                        "sets the upscaler. With DLSS or FSR set under Upscaling their TAA always runs, and the "
+                        "choice here runs along with it. Takes effect at once.",
     [UI_MENU_AA_GAME] = "Game SMAA",
     [UI_MENU_AA_FXAA] = "FXAA",
     [UI_MENU_AA_SMAA] = "SMAA (Ultra)",
     [UI_MENU_AA_TAA_DLSS] = "TAA (NVIDIA DLAA)",
     [UI_MENU_AA_TAA_FSR] = "TAA (AMD FSR 3.1)",
-    [UI_MENU_AA_UPSCALER] = "set by Upscaling",
+    [UI_MENU_AA_TAA_FSR4] = "TAA (%s)",   // FSR 4's name as the Upscaling row gives it ("AMD FSR 4.1")
+    [UI_MENU_AA_WITH_TAA] = "plus TAA from Upscaling",
 
     [UI_MENU_FPS_LIMIT] = "Frame rate limit",
     [UI_MENU_FPS_LIMIT_DESC] = "The highest frame rate the game draws at. Frame generation adds its frames on top.",
@@ -844,14 +846,16 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_AA] = "Сглаживание",
     [UI_MENU_AA_DESC] = "Как сглаживаются края 3D-картинки. SMAA игры — собственное, как на консоли. «Выкл.» оставляет края "
                         "как есть. FXAA быстрое и слегка мягкое. SMAA находит больше краёв, чем игровое, и сохраняет "
-                        "чёткость. TAA — это DLSS или FSR 3.1 в полном размере: самые устойчивые края в движении; задаёт "
-                        "масштабирование. Действует сразу.",
+                        "чёткость. TAA — это DLSS или FSR в полном размере: самые устойчивые края в движении; задаёт "
+                        "масштабирование. Когда в Upscaling выбран DLSS или FSR, их TAA работает всегда, а "
+                        "выбранное здесь — вместе с ним. Действует сразу.",
     [UI_MENU_AA_GAME] = "SMAA игры",
     [UI_MENU_AA_FXAA] = "FXAA",
     [UI_MENU_AA_SMAA] = "SMAA (Ultra)",
     [UI_MENU_AA_TAA_DLSS] = "TAA (NVIDIA DLAA)",
     [UI_MENU_AA_TAA_FSR] = "TAA (AMD FSR 3.1)",
-    [UI_MENU_AA_UPSCALER] = "задано масштабированием",
+    [UI_MENU_AA_TAA_FSR4] = "TAA (%s)",
+    [UI_MENU_AA_WITH_TAA] = "плюс TAA из Upscaling",
 
     [UI_MENU_FPS_LIMIT] = "Ограничение частоты кадров",
     [UI_MENU_FPS_LIMIT_DESC] = "Максимальная частота кадров, которые рисует игра. Генерация кадров добавляет свои сверх неё.",
@@ -1835,14 +1839,16 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_AA] = "Antisserrilhado",
     [UI_MENU_AA_DESC] = "Como as bordas da imagem 3D são suavizadas. SMAA do jogo é o próprio, como no console. Desligado "
                         "deixa as bordas como desenhadas. FXAA é rápido e um pouco suave. SMAA encontra mais bordas que o do "
-                        "jogo e mantém os detalhes nítidos. TAA é o DLSS ou o FSR 3.1 em tamanho cheio: as bordas mais "
-                        "estáveis em movimento; define o escalonamento. Vale na hora.",
+                        "jogo e mantém os detalhes nítidos. TAA é o DLSS ou o FSR em tamanho cheio: as bordas mais "
+                        "estáveis em movimento; define o escalonamento. Com DLSS ou FSR em Upscaling, o TAA deles "
+                        "sempre roda, e a escolha daqui roda junto. Vale na hora.",
     [UI_MENU_AA_GAME] = "SMAA do jogo",
     [UI_MENU_AA_FXAA] = "FXAA",
     [UI_MENU_AA_SMAA] = "SMAA (Ultra)",
     [UI_MENU_AA_TAA_DLSS] = "TAA (NVIDIA DLAA)",
     [UI_MENU_AA_TAA_FSR] = "TAA (AMD FSR 3.1)",
-    [UI_MENU_AA_UPSCALER] = "definido pelo escalonamento",
+    [UI_MENU_AA_TAA_FSR4] = "TAA (%s)",
+    [UI_MENU_AA_WITH_TAA] = "mais o TAA do Upscaling",
     [UI_MENU_TAB_CHEATS] = "Cheats",
     [UI_MENU_CHEATS_NONE] = "Nenhum cheat para esta versão do jogo. Os cheats de um mod são um arquivo de cheats do "
                             "Atmosphere na pasta cheats dele, com o nome da build do jogo: mods\\<mod>\\cheats\\%s. "
@@ -2614,13 +2620,15 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_FXAA_DESC] = "游戏自身的 FXAA 边缘平滑。会让细节略微模糊；开启 DLAA 时不需要。",
     [UI_MENU_AA] = "抗锯齿",
     [UI_MENU_AA_DESC] = "3D 画面边缘的平滑方式。游戏 SMAA 是游戏自带的，与主机相同。关闭则保留原始边缘。FXAA 快速，略显柔和。SMAA 比游戏自带的找到更多边缘，并保持细节清晰。TAA 即全尺寸的 DLSS 或 "
-                        "FSR 3.1：运动中边缘最稳定；它会设置放大方式。立即生效。",
+                        "FSR：运动中边缘最稳定；它会设置放大方式。在 Upscaling 中选择 DLSS 或 FSR 时，它们的 TAA 始终运行，"
+                        "此处的选择与其一同运行。立即生效。",
     [UI_MENU_AA_GAME] = "游戏 SMAA",
     [UI_MENU_AA_FXAA] = "FXAA",
     [UI_MENU_AA_SMAA] = "SMAA（极高）",
     [UI_MENU_AA_TAA_DLSS] = "TAA（NVIDIA DLAA）",
     [UI_MENU_AA_TAA_FSR] = "TAA（AMD FSR 3.1）",
-    [UI_MENU_AA_UPSCALER] = "由放大设置决定",
+    [UI_MENU_AA_TAA_FSR4] = "TAA（%s）",
+    [UI_MENU_AA_WITH_TAA] = "另加 Upscaling 的 TAA",
     [UI_MENU_TAB_CHEATS] = "金手指",
     [UI_MENU_CHEATS_NONE] = "此游戏版本没有金手指。模组的金手指是它的 cheats 文件夹中以游戏构建命名的 Atmosphere "
                             "金手指文件：mods\\<模组>\\cheats\\%s。重启游戏后才会读取。对于修改游戏代码的金手指，"

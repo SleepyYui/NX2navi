@@ -1760,7 +1760,10 @@ static void op_one(VkExec *ex, const op_hdr *h) {
     }
 }
 
-// ---- replay workers (NX2NAVI_REPLAY_WORKERS, default 0: the replay records every op on the submitting thread)
+// ---- replay workers (NX2NAVI_REPLAY_WORKERS, default 3; 0: the replay records every op on the submitting thread)
+// Default 3: on an RX 7900 XT with a Ryzen 7 5800X3D, Hyrule Field standing went from 41.2 to 50.4 fps (2026-11-12, one
+// batch), with the same pictures there and in Kokiri Forest, Kakariko, Goron City, a graveyard house and Gerudo
+// Valley; 5 or 7 workers measured the same as 3.
 // A submission's draws come in runs between ops that have to stay in the replay's order on its own thread (dispatches,
 // copies, texture and buffer clears, events, the game's barriers, calls). Hyrule Field, standing (NX2NAVI_REPLAY_RUNS,
 // 2026-11-11): about 3,500 draws a frame in 82 runs, 96% of them in runs of 16 draws or more and 67% in runs of 256 or
@@ -1879,12 +1882,66 @@ static int ser_kind(uint32_t op) {
 static Chunk *chunk_take(void);
 static void chunk_record(Chunk *c, int pool);
 
+// ---- side work (vk_exec_par): the replay thread hands the workers a loop over n items while they have no chunk to
+// record, at a submission's start (vk_usnap.c copy_regions). One job at a time, in a static slot: seq is odd while it
+// runs. A worker counts itself in (PJ.in) and checks seq again before it reads the job, and the caller, once every
+// slice is done, makes seq even and waits until no worker is in, so none reads a job that has ended.
+static struct {
+    void (*fn)(void *, int, int);
+    void *arg;
+    int n, grain;
+    volatile int32_t next, left, in;
+    volatile uint32_t seq;
+} PJ;
+static PlatMutex pj_lock = PLAT_MUTEX_INIT;
+
+static void par_slices(void) {
+    for (;;) {
+        int lo = __atomic_fetch_add(&PJ.next, PJ.grain, __ATOMIC_ACQ_REL);
+        if (lo >= PJ.n) return;
+        int hi = lo + PJ.grain < PJ.n ? lo + PJ.grain : PJ.n;
+        PJ.fn(PJ.arg, lo, hi);
+        __atomic_sub_fetch(&PJ.left, hi - lo, __ATOMIC_ACQ_REL);
+    }
+}
+
+static int par_pending(void) { return __atomic_load_n(&PJ.seq, __ATOMIC_ACQUIRE) & 1; }
+
+static void par_help(void) {
+    uint32_t s = __atomic_load_n(&PJ.seq, __ATOMIC_ACQUIRE);
+    if (!(s & 1)) return;
+    __atomic_add_fetch(&PJ.in, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&PJ.seq, __ATOMIC_SEQ_CST) == s) par_slices();
+    __atomic_sub_fetch(&PJ.in, 1, __ATOMIC_SEQ_CST);
+}
+
+void vk_exec_par(void (*fn)(void *, int, int), void *arg, int n, int grain) {
+    if (grain < 1) grain = 1;
+    if (RW.n <= 0 || n <= grain || Q.drained != Q.out) {
+        if (n > 0) fn(arg, 0, n);
+        return;
+    }
+    plat_mutex_lock(&pj_lock);
+    PJ.fn = fn, PJ.arg = arg, PJ.n = n, PJ.grain = grain;
+    __atomic_store_n(&PJ.next, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&PJ.left, n, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&PJ.seq, 1, __ATOMIC_SEQ_CST);   // odd: running
+    for (int k = 0; k < RW.n; k++)
+        if (__atomic_load_n(&RW.w[k]->sleeping, __ATOMIC_SEQ_CST)) plat_event_set(&RW.w[k]->wake);
+    par_slices();
+    while (__atomic_load_n(&PJ.left, __ATOMIC_ACQUIRE) > 0) plat_pause();
+    __atomic_add_fetch(&PJ.seq, 1, __ATOMIC_SEQ_CST);   // even: ended
+    while (__atomic_load_n(&PJ.in, __ATOMIC_SEQ_CST)) plat_pause();
+    plat_mutex_unlock(&pj_lock);
+}
+
 static void rw_main(void *arg) {
     RwWorker *w = arg;
     plat_thread_priority(PLAT_PRIO_HIGHEST);   // as the recording thread (rec_claim)
     perf_lock_timing_here();   // NX2NAVI_LOCK_TIME, as on the recording thread
     vk_exec_draw_ctx_use(w->dc);
     for (;;) {
+        par_help();
         Chunk *c = chunk_take();
         if (c) {
             chunk_record(c, w->idx);
@@ -1892,13 +1949,16 @@ static void rw_main(void *arg) {
         }
         // spins about 100 us after a chunk (the next group of the frame is usually closer), then sleeps
         uint64_t t0 = kern_now_ns();
-        for (unsigned i = 0; __atomic_load_n(&Q.take, __ATOMIC_SEQ_CST) >= __atomic_load_n(&Q.put, __ATOMIC_SEQ_CST); i++) {
+        for (unsigned i = 0; __atomic_load_n(&Q.take, __ATOMIC_SEQ_CST) >= __atomic_load_n(&Q.put, __ATOMIC_SEQ_CST);
+             i++) {
+            if (par_pending()) break;
             if ((i & 63) || kern_now_ns() - t0 < 100000) {
                 plat_pause();
                 continue;
             }
             __atomic_store_n(&w->sleeping, 1, __ATOMIC_SEQ_CST);
-            if (__atomic_load_n(&Q.take, __ATOMIC_SEQ_CST) >= __atomic_load_n(&Q.put, __ATOMIC_SEQ_CST))
+            if (__atomic_load_n(&Q.take, __ATOMIC_SEQ_CST) >= __atomic_load_n(&Q.put, __ATOMIC_SEQ_CST) &&
+                !par_pending())
                 plat_event_wait_ns(&w->wake, 2000000);
             __atomic_store_n(&w->sleeping, 0, __ATOMIC_RELAXED);
             t0 = kern_now_ns();
@@ -2380,10 +2440,15 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
 // scheduler prefers it over the guest's other cores (NX2NAVI_RECORDER_PRIO=0 leaves the guest's priorities alone) and
 // gets a core of its own (plat_cpu_reserve): every other thread of the process, the guest's cores, the audio, the
 // shader and pipeline workers, is kept off it, so nothing of this process preempts the recording. That core is then
-// lost to the rest, so NX2NAVI_RECORDER_CORE=auto (the default) reserves it only with 12 or more logical processors,
-// and not while the process runs on the die with the largest L3 alone (perf.c cpu_placement): on a two-die X3D part
-// the game's threads already have that die to themselves, and a core taken from them cost frames; 1 always, 0 never.
-// Linux reserves none with fewer than four fast cores.
+// lost to the rest, so NX2NAVI_RECORDER_CORE=auto reserves it only with 12 or more logical processors, and not while
+// the process runs on the die with the largest L3 alone (perf.c cpu_placement): on a two-die X3D part the game's
+// threads already have that die to themselves, and a core taken from them cost frames; 1 always, 0 never. Linux
+// reserves none with fewer than four fast cores.
+// 0 is the default: on an i9-14900KF (8 performance and 16 efficiency cores, 32 logical processors) with the replay on
+// its own thread, the reserved core (logical processors 14 and 15) left the woken replay thread unscheduled for about
+// 200 ms roughly once a second while the game stood in Kakariko: its queue held 40 to 50 items, its lock was free, the
+// wakes had been sent and it used no CPU time, while the game waited on a fence of the work in that queue (27 frames a
+// minute with a 150 ms or longer frame). With no core reserved the same minute had none.
 // The recording thread is not the first to call vk_exec_record: the game's main thread submits first and goes on
 // submitting a little at a time, while another guest thread does the work (Kokiri Forest: that thread spent 21.9 of
 // the 22.5 s the replay took in a minute and a half, the first one 0.5 s). The first thread to have spent
@@ -2414,6 +2479,8 @@ static void rec_claim(void) {
                       "NX2NAVI_RECORDER_CORE=0 turns it off)", n > 1 ? "s" : "", which, n, ncpu);
         else rt_log("vk: no core was reserved for the recording thread (too few fast cores, or the system refused it; "
                     "NX2NAVI_RECORDER_CORE=0 stops the attempt)");
+    } else {
+        rt_log("vk: the recording thread runs on any core (NX2NAVI_RECORDER_CORE=auto or 1 reserves one)");
     }
 }
 

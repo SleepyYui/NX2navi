@@ -195,7 +195,9 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   composite (edges, blending weights, composition into the scene target as square-rooted RGB9E5 words). `off`, `fxaa`
   and `smaa` leave out the first two and replace the composition with `shaders/aa_post.comp` or SMAA at its Ultra preset
   (`shaders/smaa_*.comp`); the game's passes are known by a hash of their guest code (`vk_exec_draw.c` `aa_dispatch`).
-  `taa` is DLSS or FSR 3.1 at the scene's size; while either runs, the game's SMAA stays.
+  `taa` is DLSS or FSR at the scene's size with the game's SMAA. While DLSS or FSR runs (`dlaa`, any mode), the other
+  values still choose the pass: in the native modes it smooths the upscaler's picture after the bloom, in the scaling
+  modes it runs on the scene before the upscaler scales it.
 - HDR (`vk_hdr.c`): the game tonemaps its scene into a float target, upscales it, draws the HUD into a second float
   target and copies that into the 8-bit sRGB window texture it presents. With `NX2NAVI_HDR=1` the tonemap shader gets
   the function of `shaders/hdr_tonemap.frag` spliced in where its SDR curve clamps each channel, so the float picture
