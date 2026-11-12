@@ -39,12 +39,48 @@ int main(void) {
     return 0;
 }
 '''
+match = re.search(r'static int skull_tally\(const int now\[SKULL_COUNT\], int8_t want\[SKULL_COUNT\]\) \{', source)
+assert match, 'the token count is not derived from the collection flags'
+tally = source[match.start():source.index('\n}', match.end()) + 2]
+tally_harness = r'''
+#include <assert.h>
+#include <stdint.h>
+enum { SKULL_COUNT = 100 };
+''' + tally + r'''
+int main(void) {
+    int now[SKULL_COUNT] = {0};
+    int8_t want[SKULL_COUNT];
+    for (int i = 0; i < SKULL_COUNT; i++) want[i] = -1;
+    assert(skull_tally(now, want) == 0);
+    for (int i = 0; i < 11; i++) now[i] = 1;
+    assert(skull_tally(now, want) == 11);
+    // Eighteen changes asked for and not applied by the game yet count already.
+    for (int i = 11; i < 29; i++) want[i] = 1;
+    assert(skull_tally(now, want) == 29);
+    assert(want[11] == 1);
+    // Applied ones are forgotten and still count once.
+    for (int i = 11; i < 29; i++) now[i] = 1;
+    assert(skull_tally(now, want) == 29);
+    for (int i = 11; i < 29; i++) assert(want[i] == -1);
+    // Taking one back lowers the count before the game has applied it.
+    want[0] = 0;
+    assert(skull_tally(now, want) == 28);
+    assert(want[0] == 0);
+    // A flag that cannot be read leaves the count alone, unless a change for it is pending.
+    now[50] = -1;
+    assert(skull_tally(now, want) == -1);
+    want[50] = 1;
+    assert(skull_tally(now, want) == 29);
+    return 0;
+}
+'''
 clang = Path(os.environ.get('NX2NAVI_TEST_CLANG', str(Path(os.environ.get('LOCALAPPDATA', '')) /
              'Programs/NX2navi/toolchain/msys64/ucrt64/bin/clang.exe')))
 with tempfile.TemporaryDirectory() as tmp:
-    c = Path(tmp) / 'lookup.c'
-    exe = Path(tmp) / 'lookup.exe'
-    c.write_text(harness, encoding='utf-8')
-    subprocess.run([str(clang), '-Wall', '-Wextra', '-Werror', str(c), '-o', str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
-print('Individual collectible lookup checks passed')
+    for name, text in (('lookup', harness), ('tally', tally_harness)):
+        c = Path(tmp) / f'{name}.c'
+        exe = Path(tmp) / f'{name}.exe'
+        c.write_text(text, encoding='utf-8')
+        subprocess.run([str(clang), '-Wall', '-Wextra', '-Werror', str(c), '-o', str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)
+print('Individual collectible lookup and token count checks passed')

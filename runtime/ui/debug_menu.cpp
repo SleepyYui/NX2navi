@@ -441,7 +441,16 @@ void tab_skulls(void) {
         if (values[i] >= 0) available++, collected += values[i] != 0;
     }
     ImGui::Text("Collected: %d / %d", collected, available);
-    ImGui::TextWrapped("These are the individual flags the game counts. Save normally after changing them. Reload the area to refresh its spiders and tokens.");
+    int tokens = dbg_skull_tokens();
+    if (tokens >= 0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("   Token count: %d", tokens);
+        if (tokens != collected && available == 100) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Match the count")) dbg_skull_tokens_match();
+        }
+    }
+    ImGui::TextWrapped("These are the individual flags the game counts. A change also sets the token count, which the House of Skulltula and its rewards read, to the number collected. Save normally after changing them. Reload the area to refresh its spiders and tokens.");
     ImGui::TextWrapped("Travel nearby uses the nearest named entrance, not the spider's exact position. The area may autosave. Area variants do not change Link's age.");
     char travel_status[160];
     dbg_status(travel_status);

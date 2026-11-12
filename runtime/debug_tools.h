@@ -33,7 +33,9 @@ int dbg_skulls(void);
 const char *dbg_skull_area(int i);
 int dbg_skull_pos(int i, float xyz[3]);
 int dbg_skull_collected(int i);
-void dbg_skull_set(int i, int on);
+void dbg_skull_set(int i, int on);       // also sets the token count to the number collected
+int dbg_skull_tokens(void);              // the token count the game shows and its rewards read; -1 not loaded
+void dbg_skull_tokens_match(void);       // sets the token count to the number collected
 // Travel uses the nearest named entrance in the placement's area; it does not put Link at the spider's coordinates.
 const char *dbg_skull_entrance(int i);   // NULL when no known entrance has coordinates
 int dbg_skull_travel(int i);

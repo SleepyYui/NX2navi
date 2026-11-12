@@ -81,7 +81,7 @@ float dbg_speed_factor(void) { return speed_factor; }
 void dbg_speed_set(float factor) { speed_factor = factor >= 0.05f && factor <= 8.0f ? factor : 1.0f; }
 
 // ---- what the menu asks for, done by dbg_tick
-enum { Q_FLAG, Q_WRITE, Q_SKULL, Q_MAX = 256, FREEZE_MAX = 64 };
+enum { Q_FLAG, Q_WRITE, Q_SKULL, Q_TOKENS, Q_MAX = 256, FREEZE_MAX = 64 };
 typedef struct { int kind; uint32_t hash; uint64_t addr, value; int size; } Req;
 static PlatMutex q_lock = PLAT_MUTEX_INIT;
 static Req q[Q_MAX];
@@ -333,8 +333,30 @@ int dbg_skull_collected(int i) {
     uint8_t value = 0;
     return index >= 0 && rd(rd_ptr(m + 0xc60) + (uint64_t)index * 16 + 12, &value, 1) ? value != 0 : -1;
 }
+// A change carries the placement's position in the list (in the request's hash) for the token count below.
 void dbg_skull_set(int i, int on) {
-    if (i >= 0 && i < dbg_skulls()) ask((Req){Q_SKULL, 0, skulls[i].key, (uint64_t)(on != 0), 0});
+    if (i >= 0 && i < dbg_skulls()) ask((Req){Q_SKULL, (uint32_t)i, skulls[i].key, (uint64_t)(on != 0), 0});
+}
+void dbg_skull_tokens_match(void) { ask((Req){Q_TOKENS, 0, 0, 0, 0}); }
+
+// The token count is an integer of its own beside the 100 flags: the pause screen shows it, and the House of
+// Skulltula and its rewards read it. Picking up a token raises it and sets its flag, so after a change here the count
+// is set to the number collected. skull_want holds the value last asked for each flag until the game holds it (the
+// manager applies queued changes at its next update), so changes not applied yet count already. The game's thread
+// alone uses it.
+static int8_t skull_want[SKULL_COUNT] = {[0 ... SKULL_COUNT - 1] = -1};
+
+// The number collected once the changes asked for are applied: now[i] is what the game holds (-1 when it cannot be
+// read), want[i] the value asked for (-1 none), forgotten once the game holds it. -1 when a flag can be read neither way.
+static int skull_tally(const int now[SKULL_COUNT], int8_t want[SKULL_COUNT]) {
+    int n = 0;
+    for (int i = 0; i < SKULL_COUNT; i++) {
+        if (want[i] >= 0 && now[i] == want[i]) want[i] = -1;
+        if (want[i] >= 0) n += want[i];
+        else if (now[i] < 0) return -1;
+        else n += now[i] > 0;
+    }
+    return n;
 }
 
 // A named entrance in the most specific matching area, closest to this placement. An area variant must match a
@@ -671,6 +693,34 @@ static int text_set(const char *name, const char *value) {
 
 static void enum_set(Cpu *c, const char *name, const char *value) {
     rt_call(c, MOD_MAIN_BASE + 0x3e0980, 3, gmd(), (uint64_t)hash_of(value), (uint64_t)hash_of(name));
+}
+
+// Integers are kind 2: an entry is 0x28 bytes, its value at +0x1c. main+0xfc42d0 (manager, value, hash) queues the
+// change of one as main+0x682b20 does for a flag: a record {value, hash, 1} of 12 bytes at [manager+0xf8], the room
+// for them at +0xf0 and the records in use in the low 20 bits of +0x100. The game applies them at its next update.
+enum { GD_INT = 2 };
+static const char TOKEN_COUNT[] = "PouchData.Item_Token_Gold.StockNum";
+
+int dbg_skull_tokens(void) {
+    uint64_t e = gmd_entry(GD_INT, 0x28, hash_of(TOKEN_COUNT));
+    int32_t value = 0;
+    return e && rd(e + 0x1c, &value, 4) ? value : -1;
+}
+
+// The game's thread: the token count set to the number collected (skull_tally).
+static void skull_tokens_sync(Cpu *c, uint64_t m) {
+    int now[SKULL_COUNT];
+    for (int i = 0; i < SKULL_COUNT; i++) now[i] = dbg_skull_collected(i);
+    int count = skull_tally(now, skull_want);
+    uint32_t hash = hash_of(TOKEN_COUNT), room = 0, used = 0;
+    if (count < 0 || !gmd_entry(GD_INT, 0x28, hash) || !rd(m + 0xf0, &room, 4) || !rd(m + 0x100, &used, 4) ||
+        (used & 0xfffff) >= room) {
+        stat_refused++;
+        rt_log("debug: token count not set: a collection flag, the count or the game's queue unavailable");
+        return;
+    }
+    rt_call(c, MOD_MAIN_BASE + 0xfc42d0, 3, m, (uint64_t)(uint32_t)count, (uint64_t)hash);
+    rt_log("debug: token count set to %d, the Skulltulas collected", count);
 }
 
 // ---- events. main+0xd79f10 builds an event request in a block of 0x2000 bytes: the event's name goes into the buffer
@@ -1340,8 +1390,11 @@ void dbg_tick(Cpu *c) {
     for (int i = 0; i < frozen_n && n < Q_MAX; i++) todo[n++] = (Req){Q_WRITE, 0, frozen[i].addr, frozen[i].value, frozen[i].size};
     plat_mutex_unlock(&q_lock);
     uint64_t m = gmd();
+    int tokens = 0;   // the token count follows the collection flags (skull_tokens_sync)
     for (int i = 0; i < n; i++) {
-        if (todo[i].kind == Q_FLAG) {
+        if (todo[i].kind == Q_TOKENS) {
+            tokens = 1;
+        } else if (todo[i].kind == Q_FLAG) {
             if (!m) continue;
             rt_call(c, MOD_MAIN_BASE + 0x682b20, 3, m, todo[i].value, (uint64_t)todo[i].hash);
             stat_flags++;
@@ -1358,10 +1411,13 @@ void dbg_tick(Cpu *c) {
             // main+0xf071c0 enqueues {Boolean, record index}; main+0xba24b0 applies it and updates save bookkeeping.
             rt_call(c, MOD_MAIN_BASE + 0xf071c0, 4, m + 0xc58, todo[i].value, todo[i].addr, (uint64_t)index);
             stat_flags++;
+            if (todo[i].hash < SKULL_COUNT) skull_want[todo[i].hash] = (int8_t)(todo[i].value != 0);
+            tokens = 1;
             rt_log("debug: Skulltula collection flag changed to %s", todo[i].value ? "collected" : "uncollected");
         } else if (todo[i].size == 1 || todo[i].size == 2 || todo[i].size == 4) {
             if (wr(todo[i].addr, &todo[i].value, (size_t)todo[i].size)) stat_writes++;
             else stat_refused++;
         }
     }
+    if (tokens && m) skull_tokens_sync(c, m);
 }
