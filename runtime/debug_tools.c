@@ -695,11 +695,24 @@ static void enum_set(Cpu *c, const char *name, const char *value) {
     rt_call(c, MOD_MAIN_BASE + 0x3e0980, 3, gmd(), (uint64_t)hash_of(value), (uint64_t)hash_of(name));
 }
 
-// Integers are kind 2: an entry is 0x28 bytes, its value at +0x1c. main+0xfc42d0 (manager, value, hash) queues the
-// change of one as main+0x682b20 does for a flag: a record {value, hash, 1} of 12 bytes at [manager+0xf8], the room
-// for them at +0xf0 and the records in use in the low 20 bits of +0x100. The game applies them at its next update.
+// Integers are kind 2: an entry is 0x28 bytes, its value at +0x1c. main+0xfc42d0 (manager, amount, hash) queues an
+// addition to one: a record {amount, hash, 1} of 12 bytes at [manager+0xf8], the room for them at +0xf0 and the
+// records in use in the low 20 bits of +0x100. The game applies them at its next update and adds the amount to the
+// value (eight calls with 29 took a count of 11 to 243), so the count is changed by the difference.
 enum { GD_INT = 2 };
 static const char TOKEN_COUNT[] = "PouchData.Item_Token_Gold.StockNum";
+
+static int32_t token_base, token_pending;   // the count read when additions were queued, and their sum not applied yet
+// What to add for the count to reach target, now being the count the game holds. Additions queued before count until
+// the game has applied them, which shows as a count other than the one read when they were queued.
+static int32_t skull_token_delta(int target, int now) {
+    if (token_pending && now != token_base) token_pending = 0;
+    int32_t delta = target - (now + token_pending);
+    if (!delta) return 0;
+    if (!token_pending) token_base = now;
+    token_pending += delta;
+    return delta;
+}
 
 int dbg_skull_tokens(void) {
     uint64_t e = gmd_entry(GD_INT, 0x28, hash_of(TOKEN_COUNT));
@@ -711,16 +724,17 @@ int dbg_skull_tokens(void) {
 static void skull_tokens_sync(Cpu *c, uint64_t m) {
     int now[SKULL_COUNT];
     for (int i = 0; i < SKULL_COUNT; i++) now[i] = dbg_skull_collected(i);
-    int count = skull_tally(now, skull_want);
+    int count = skull_tally(now, skull_want), held = dbg_skull_tokens();
     uint32_t hash = hash_of(TOKEN_COUNT), room = 0, used = 0;
-    if (count < 0 || !gmd_entry(GD_INT, 0x28, hash) || !rd(m + 0xf0, &room, 4) || !rd(m + 0x100, &used, 4) ||
-        (used & 0xfffff) >= room) {
+    if (count < 0 || held < 0 || !rd(m + 0xf0, &room, 4) || !rd(m + 0x100, &used, 4) || (used & 0xfffff) >= room) {
         stat_refused++;
         rt_log("debug: token count not set: a collection flag, the count or the game's queue unavailable");
         return;
     }
-    rt_call(c, MOD_MAIN_BASE + 0xfc42d0, 3, m, (uint64_t)(uint32_t)count, (uint64_t)hash);
-    rt_log("debug: token count set to %d, the Skulltulas collected", count);
+    int32_t delta = skull_token_delta(count, held);
+    if (!delta) return;
+    rt_call(c, MOD_MAIN_BASE + 0xfc42d0, 3, m, (uint64_t)(uint32_t)delta, (uint64_t)hash);
+    rt_log("debug: token count %d changed by %d to %d, the Skulltulas collected", held, delta, count);
 }
 
 // ---- events. main+0xd79f10 builds an event request in a block of 0x2000 bytes: the event's name goes into the buffer

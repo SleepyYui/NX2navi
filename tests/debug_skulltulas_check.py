@@ -74,10 +74,37 @@ int main(void) {
     return 0;
 }
 '''
+match = re.search(r'static int32_t skull_token_delta\(int target, int now\) \{', source)
+assert match, 'the token count is not changed by a difference'
+start = source.rindex('\nstatic int32_t token_base', 0, match.start()) + 1
+delta = source[start:source.index('\n}', match.end()) + 2]
+delta_harness = r'''
+#include <assert.h>
+#include <stdint.h>
+''' + delta + r'''
+int main(void) {
+    // The game adds what is queued; 11 and a target of 29 add 18 once.
+    assert(skull_token_delta(29, 11) == 18);
+    assert(skull_token_delta(29, 11) == 0);    // not applied yet: nothing more
+    assert(skull_token_delta(29, 29) == 0);    // applied
+    // A count raised too far comes back down.
+    assert(skull_token_delta(29, 243) == -214);
+    assert(skull_token_delta(29, 243) == 0);
+    assert(skull_token_delta(29, 29) == 0);
+    // A second change before the first is applied adds only the rest.
+    assert(skull_token_delta(30, 29) == 1);
+    assert(skull_token_delta(28, 29) == -2);
+    assert(skull_token_delta(28, 28) == 0);
+    // A token picked up in the game raises the count and its flag together: nothing to add.
+    assert(skull_token_delta(29, 29) == 0);
+    assert(skull_token_delta(30, 30) == 0);
+    return 0;
+}
+'''
 clang = Path(os.environ.get('NX2NAVI_TEST_CLANG', str(Path(os.environ.get('LOCALAPPDATA', '')) /
              'Programs/NX2navi/toolchain/msys64/ucrt64/bin/clang.exe')))
 with tempfile.TemporaryDirectory() as tmp:
-    for name, text in (('lookup', harness), ('tally', tally_harness)):
+    for name, text in (('lookup', harness), ('tally', tally_harness), ('delta', delta_harness)):
         c = Path(tmp) / f'{name}.c'
         exe = Path(tmp) / f'{name}.exe'
         c.write_text(text, encoding='utf-8')
