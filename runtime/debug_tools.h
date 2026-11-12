@@ -34,7 +34,7 @@ int dbg_names(int *found);             // 0 not started, 1 being read from the g
 // time: nothing is taken while dbg_busy. dbg_status is the last thing that happened, in words.
 int dbg_places(void);
 const char *dbg_place_area(int i);
-const char *dbg_place_pos(int i);      // "": the area's default start
+const char *dbg_place_pos(int i);      // never "": a teleport without a listed position takes the area's first
 void dbg_warp(const char *area, const char *pos);
 int dbg_events(void);
 const char *dbg_event_name(int i);
@@ -48,6 +48,8 @@ int dbg_freecam_available(void);       // the build has the camera's patch set
 void dbg_freecam_set(int on, int sticks, float speed);
 void dbg_freecam_reset(void);          // back to the game's view, free again from there
 int dbg_freecam(int *sticks, float *speed, double pos[3]);   // on or off
+int dbg_freecam_flying(void);          // on, with the sticks: vk_dlaa.c reads the ground's distance back for it
+void dbg_freecam_ground(const float *dist, int n);   // the replay's thread: view distances in the lower view, 0 sky
 
 // Memory: values of 1, 2 or 4 bytes in the game's heap.
 int dbg_search_new(uint32_t value, int size);       // returns the number of places

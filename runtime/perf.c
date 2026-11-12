@@ -745,6 +745,16 @@ static void cpu_placement(void) {
                    one_mode == 2 ? " in the B blocks" : "");
         else
             one_mode = 0;
+        // The largest L3 is a reason to stay on its processors only where it serves enough cores to run the game: two
+        // dies of one design, one of them with stacked cache (a two-die X3D desktop part, 8 cores a die). A die of
+        // fewer cores holds the game to them: the 4 large cores of a mobile part whose 8 small cores share a smaller
+        // L3, or the 6 of a 12-core X3D part, where the recording thread's own core (vk_exec.c rec_claim) left 5.
+        int die_cores = __builtin_popcountll(cpu_die & cpu_one);
+        if (cpu_die && cpu_die != cpu_all && die_cores < 8) {
+            rt_log("cpu: logical processors %#llx of %#llx share the largest L3 cache (%u MiB), but only %d cores: not "
+                   "used", (unsigned long long)cpu_die, (unsigned long long)cpu_all, kb >> 10, die_cores);
+            cpu_die = 0;
+        }
         if (cpu_die && cpu_die != cpu_all)
             rt_log("cpu: logical processors %#llx of %#llx share the largest L3 cache (%u MiB)%s",
                    (unsigned long long)cpu_die, (unsigned long long)cpu_all, kb >> 10,
@@ -762,6 +772,8 @@ static void cpu_placement(void) {
 }
 
 void perf_cpu_start(void) { cpu_placement(); }
+
+int perf_cpu_on_cache_die(void) { return cpu_applied && cpu_die && (cpu_applied & ~cpu_die) == 0; }
 
 // NX2NAVI_CRASH_FILTER_GUARD (default 1; 0 off): once a second, the crash report's last-chance exception filter is put
 // back if a DLL loaded after the start (a GPU driver, an overlay) set its own in its place. Without it, a fault in such

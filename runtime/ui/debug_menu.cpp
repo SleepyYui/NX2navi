@@ -309,9 +309,12 @@ void tab_world(void) {
         ImGui::TextDisabled("x %.1f   y %.1f   z %.1f", at[0], at[1], at[2]);
     }
     if (changed) dbg_freecam_set(on, sticks, cam_speed);
-    ImGui::TextWrapped("Close this menu to fly: the left stick moves along the view and sideways, the right stick turns, ZR and ZL "
-                       "go up and down, R is four times as fast and L four times as slow. The game goes on meanwhile and "
-                       "draws what the camera sees; the game speed above slows it down. The camera does not stop at walls.");
+    ImGui::TextWrapped("Close this menu to fly: the left stick moves level, ahead and sideways, the right stick turns, ZR and ZL "
+                       "go up and down, R is four times as fast and L four times as slow. The height changes only with ZR "
+                       "and ZL, and with DLSS, DLAA or FSR 3.1 or 4 on the camera rises where the ground ahead or below comes "
+                       "within a few metres. The game goes on meanwhile and draws what the camera sees; the game speed above "
+                       "slows it down. Without those upscalers it does not stop at hills: below the ground the picture shows "
+                       "the void under the map, not a missing floor.");
 }
 
 // ---- memory

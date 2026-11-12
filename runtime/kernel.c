@@ -90,6 +90,8 @@ struct RtThread {
     const uint32_t *whs;       // a WaitSynchronization that blocks: its handles, in the waiter's own memory (holding G)
     int wn;
     uint32_t waker;            // the thread whose signal ended the last wait (0: a host thread or a timeout)
+    uint64_t blk_since;        // when the current blocking wait began, 0 while not blocked (holding G; wait_watch)
+    int blk_told;              // wait_watch logged the current wait
     uint64_t wake_at, grant_at;   // when a wait was signalled and a core granted, until the thread runs again
     uint64_t lw_ns, lw_n, lw_max, lg_ns, lg_n, lg_max, sl_n, sl_req, sl_act;   // those latencies; SleepThread asked/took
     uint64_t sp_n, sp_ho, sp_site;   // spin wait passes and core handoffs, the last loop head (the thread writes them)
@@ -939,9 +941,61 @@ static uint32_t block(RtThread *t, int kind, int64_t ns) {
     core_put(t);
     acct(t, st_of(kind));
     t->nblk++;
+    t->blk_since = kern_now_ns(), t->blk_told = 0;
     uint32_t r = block_inner(t, kind, ns);
+    t->blk_since = 0;
     core_take(t);
     return r;
+}
+
+// ---- long waits (a freeze's first clue)
+// A guest thread that waits NX2NAVI_WAIT_WATCH_S seconds for a lock, or for another thread to end, is logged once per
+// wait with the thread it waits for and what that one is doing: a game that stops with nothing in its log then names
+// the chain. Waits on condition variables, events and addresses are left out: idle worker threads wait on them for
+// good. Off by default (0), as its thread takes the kernel lock every 2 s; 10 is a good value for a hang report.
+#define WAIT_WATCH_LINES 24
+
+static void wait_watch_holder(char *out, size_t cap, const RtThread *h) {
+    if (!h) { snprintf(out, cap, "no such thread"); return; }
+    if (h->exited) { snprintf(out, cap, "thread %#x, which has ended", h->handle); return; }
+    if (!h->blk_since) { snprintf(out, cap, "thread %#x (priority %d), not waiting", h->handle, h->prio); return; }
+    static const char *const kinds[] = {"nothing", "a lock", "a condition variable", "an address", "a handle"};
+    int k = h->wkind >= 0 && h->wkind <= W_SYNC ? h->wkind : 0;
+    snprintf(out, cap, "thread %#x (priority %d), itself waiting %.1f s for %s (%#llx)", h->handle, h->prio,
+             (kern_now_ns() - h->blk_since) / 1e9, kinds[k], (unsigned long long)h->wobj);
+}
+
+static void wait_watch(void *arg) {
+    (void)arg;
+    uint64_t limit = (uint64_t)atoi(cfg_value("NX2NAVI_WAIT_WATCH_S")) * 1000000000ull;
+    if (!limit) return;
+    int lines = 0;
+    while (lines < WAIT_WATCH_LINES) {
+        plat_wait_ns(2000000000ull);
+        lock();
+        uint64_t now = kern_now_ns();
+        for (RtThread *t = g_all; t && lines < WAIT_WATCH_LINES; t = t->all) {
+            if (!t->blk_since || t->blk_told || now - t->blk_since < limit) continue;
+            char who[160];
+            if (t->wkind == W_LOCK) {   // the lock word's owner field is the holder's handle
+                wait_watch_holder(who, sizeof who, h_peek((uint32_t)t->wobj, O_THREAD));
+                rt_log("kernel: thread %#x (priority %d) has waited %.0f s for the lock at %#llx held by %s",
+                       t->handle, t->prio, (now - t->blk_since) / 1e9, (unsigned long long)t->waddr, who);
+            } else if (t->wkind == W_SYNC && t->whs) {
+                const RtThread *end = NULL;
+                for (int i = 0; i < t->wn && !end; i++) end = h_peek(t->whs[i], O_THREAD);
+                if (!end) continue;
+                wait_watch_holder(who, sizeof who, end);
+                rt_log("kernel: thread %#x (priority %d) has waited %.0f s for the end of %s", t->handle, t->prio,
+                       (now - t->blk_since) / 1e9, who);
+            } else {
+                continue;
+            }
+            t->blk_told = 1, lines++;
+        }
+        unlock();
+    }
+    rt_log("kernel: %d long waits logged: no more", lines);
 }
 
 int kern_core_away(void) {
@@ -1482,6 +1536,11 @@ static void guest_main(void *p) {
 }
 
 void kern_run_on_guest_main(void (*fn)(Cpu *c)) {
+    static int watching;
+    if (!watching++) {
+        PlatThread *w = plat_thread_new(wait_watch, NULL, "wait watch");
+        if (w) plat_thread_detach(w);
+    }
     PlatThread *h = plat_thread_new_ex(guest_main, (void *)fn, "guest main", HOST_STACK);
     if (!h) rt_fatal("kernel: cannot start the guest main thread");
     plat_thread_join(h);

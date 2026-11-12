@@ -521,12 +521,28 @@ static void pb_log(const char *when) {
 // compiled with P.cache and its binaries captured. The create info is restored before returning.
 typedef struct { VkStructureType sType; const void *pNext; VkPipelineCreateFlags flags; } PipeCiHead;
 
-// Builds into P.cache against reads of its data. Every create with P.cache holds this shared (pipe_create_in); the
-// copy of the data in cache_save holds it exclusively and only takes it when no build is running. The Vulkan rules
-// allow reading a cache created without VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT while pipelines are
-// built into it, but Intel's Windows driver (101.8991 on an Arc 140V) crashed inside vkGetPipelineCacheData during the
-// copy, reading through a null entry, with compute and library builds running beside the autosave.
+// Builds into P.cache against reads of its data. Every create with P.cache holds this shared (pipe_create_in); a save
+// holds it exclusively for the copy of the data and only takes it when no build is running. The Vulkan rules allow
+// reading a cache created without VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT while pipelines are built into
+// it, but Intel's Windows driver (101.8991 on an Arc 140V) crashed inside vkGetPipelineCacheData during the copy,
+// reading through a null entry, with compute and library builds running beside the autosave. So no copy is made while
+// a build runs, on any driver.
 static PlatMutex cache_rw = PLAT_MUTEX_INIT;
+// Set while the save at exit waits for cache_rw: the builds already in the driver finish, and new ones wait in
+// cache_build_enter until the copy is made. Without it the boot's prewarm workers started builds back to back, no moment
+// without one came within the save's 5 s, and the pipelines built in that run were not saved (a window closed during
+// the prewarm, 2026-11-11). The autosave never sets it, so it never holds a build back.
+static volatile int32_t cache_saving_at_exit;
+
+// Takes cache_rw shared for a build into P.cache; while the save at exit waits for its copy, first waits for that.
+static void cache_build_enter(void) {
+    for (;;) {
+        while (__atomic_load_n(&cache_saving_at_exit, __ATOMIC_ACQUIRE)) plat_sleep_ms(1);
+        plat_mutex_lock_shared(&cache_rw);
+        if (!__atomic_load_n(&cache_saving_at_exit, __ATOMIC_ACQUIRE)) return;
+        plat_mutex_unlock_shared(&cache_rw);
+    }
+}
 
 // A pipeline cache of this thread's own that its creates build into in place of P.cache; VK_NULL_HANDLE (every thread
 // but the background builder of large compute shaders) for P.cache itself. A create into it does not hold cache_rw, so
@@ -571,7 +587,7 @@ static VkResult pipe_create_in(int kind, void *ci, VkPipeline *pipe, VkPipelineC
     int shared = cache && !own_cache;
     if (cache && own_cache) cache = own_cache;
     uint64_t t0 = perf_mark_begin();   // NX2NAVI_TRACE=perf: the create on any thread, its wait for cache_rw included
-    if (shared) plat_mutex_lock_shared(&cache_rw);
+    if (shared) cache_build_enter();
     VkResult r;
     if (shared && P.play) {
         PipeCiHead *hd = ci;
@@ -626,7 +642,7 @@ VkResult vk_pipeline_create_foreign(VkDevice dev, int compute, uint32_t n, const
         return r;
     }
     VkResult r = VK_SUCCESS;
-    plat_mutex_lock_shared(&cache_rw);
+    cache_build_enter();
     if (!P.play) {   // one cache: whether it held them is not known here; its save looks at the data's size
         r = foreign_one(dev, compute, cache, n, infos, alloc, out);
         if (r == VK_SUCCESS) __atomic_fetch_add(&FP.made, n, __ATOMIC_RELAXED), __atomic_fetch_add(&cache_merges, n, __ATOMIC_RELAXED);
@@ -1493,6 +1509,186 @@ static uint32_t *spirv_add_outputs(const uint32_t *w, uint64_t n, uint32_t missi
     memcpy(p, types, (size_t)nt * 4), p += nt;
     memcpy(p, w + fn_at, (n - fn_at) * 4), p += n - fn_at;
     *out_n = (uint64_t)(p - o);
+    return o;
+}
+
+// The locations a mesh module writes (its Output variables with a Location), and whether it draws points (execution
+// mode OutputPoints). 0 when the module cannot be read.
+static uint32_t spirv_mesh_outputs(const uint32_t *w, uint64_t n, int *points) {
+    enum { OP_EXECUTION_MODE = 16, MODE_OUTPUT_POINTS = 27 };
+    uint32_t bound = n >= 5 && w[3] < (1u << 22) ? w[3] : 0, mask = 0;
+    uint8_t *out = bound ? calloc(bound, 1) : NULL;
+    int8_t *loc = bound ? malloc(bound) : NULL;
+    *points = 0;
+    if (!out || !loc) return free(out), free(loc), 0;
+    memset(loc, -1, bound);
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        const uint32_t *a = w + i + 1;
+        if (op == OP_EXECUTION_MODE && len >= 3 && a[1] == MODE_OUTPUT_POINTS) *points = 1;
+        else if (op == SPV_OP_DECORATE && len >= 4 && a[1] == SPV_DEC_LOCATION && a[0] < bound && a[2] < 32) loc[a[0]] = (int8_t)a[2];
+        else if (op == SPV_OP_VARIABLE && len >= 4 && a[2] == SPV_SC_OUTPUT && a[1] < bound) out[a[1]] = 1;
+        else if (op == SPV_OP_FUNCTION) break;
+        i += len;
+    }
+    for (uint32_t id = 0; id < bound; id++)
+        if (out[id] && loc[id] >= 0) mask |= 1u << loc[id];
+    free(out), free(loc);
+    return mask;
+}
+
+// A fragment module whose inputs at the locations of `missing` read what Maxwell gives a fragment input no earlier
+// stage writes: (0, 0, 0, 1), or with `points` the point sprite's coordinate (s, t, 0, 1). Each such Input variable
+// (a float or a float vector) becomes a Private one, the access chains through it Private pointers, its decorations
+// go, and the entry function stores the value into it before anything else. NULL when nothing is to be done or the
+// module does not have the expected layout.
+static uint32_t *spirv_fs_fill_inputs(const uint32_t *w, uint64_t n, uint32_t missing, int points, uint64_t *out_n) {
+    enum { SC_INPUT = 1, SC_PRIVATE = 6, OP_EXECUTION_MODE = 16, OP_TYPE_POINTER = 32, OP_LABEL = 248, OP_LOAD = 61,
+           OP_STORE = 62, OP_ACCESS_CHAIN = 65, OP_IN_BOUNDS_ACCESS_CHAIN = 66, OP_COMPOSITE_CONSTRUCT = 80,
+           OP_COMPOSITE_EXTRACT = 81, OP_DECORATE_ID = 332, BUILTIN_POINT_COORD = 16, MAX_FILL = 32, MAX_PRIV = 64 };
+    if (!missing || n < 5 || w[3] >= (1u << 22)) return NULL;
+    uint32_t old_bound = w[3], bound = old_bound;
+    uint32_t *pt_type = calloc(old_bound, 4), *vec_comp = calloc(old_bound, 4), *vec_n = calloc(old_bound, 4);
+    int8_t *loc = malloc(old_bound);
+    uint8_t *fill = calloc(old_bound, 1);      // 1: a filled variable, 2: an access chain through one
+    uint32_t *o = NULL;
+    if (!pt_type || !vec_comp || !vec_n || !loc || !fill) goto done;
+    memset(loc, -1, old_bound);
+    uint32_t f32 = 0, v2 = 0, entry = 0;
+    uint64_t ep_at = 0, ann_end = 0, fn_at = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) goto done;
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_ENTRY_POINT && !ep_at) ep_at = i, entry = a[1];
+        else if (op == SPV_OP_DECORATE || op == 72 || op == OP_DECORATE_ID) {
+            ann_end = i + len;
+            if (op == SPV_OP_DECORATE && len >= 4 && a[1] == SPV_DEC_LOCATION && a[0] < old_bound && a[2] < 32)
+                loc[a[0]] = (int8_t)a[2];
+        } else if (op == SPV_OP_TYPE_FLOAT && len >= 3 && a[1] == 32) f32 = a[0];
+        else if (op == SPV_OP_TYPE_VECTOR && len >= 4 && a[0] < old_bound) {
+            vec_comp[a[0]] = a[1], vec_n[a[0]] = a[2];
+            if (a[1] == f32 && a[2] == 2) v2 = a[0];
+        } else if (op == OP_TYPE_POINTER && len >= 4 && a[0] < old_bound) pt_type[a[0]] = a[2];
+        else if (op == SPV_OP_FUNCTION) { fn_at = i; break; }
+        i += len;
+    }
+    if (!ep_at || !ann_end || !fn_at || !f32 || !entry || ann_end > fn_at) goto done;
+    // the variables to fill, and the Private pointer types they and the chains through them need (pass 1)
+    uint32_t vars[MAX_FILL], vtype[MAX_FILL], nvars = 0, priv[MAX_PRIV][2], npriv = 0;   // priv: Input pointer type -> Private
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        uint32_t ptr = 0;
+        if (op == SPV_OP_VARIABLE && len >= 4 && a[2] == SC_INPUT && a[1] < old_bound && a[0] < old_bound && i < fn_at) {
+            int l = loc[a[1]];
+            uint32_t t = pt_type[a[0]];
+            int floaty = t == f32 || (t < old_bound && vec_comp[t] == f32 && vec_n[t] >= 2 && vec_n[t] <= 4);
+            if (l >= 0 && (missing >> l & 1) && floaty && nvars < MAX_FILL) {
+                fill[a[1]] = 1, vars[nvars] = a[1], vtype[nvars++] = t, ptr = a[0];
+            }
+        } else if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 4 && a[2] < old_bound && fill[a[2]] &&
+                   a[1] < old_bound && a[0] < old_bound) {
+            fill[a[1]] = 2, ptr = a[0];
+        }
+        if (ptr) {
+            uint32_t k = 0;
+            while (k < npriv && priv[k][0] != ptr) k++;
+            if (k == npriv) {
+                if (npriv == MAX_PRIV) goto done;
+                priv[npriv][0] = ptr, priv[npriv++][1] = bound++;
+            }
+        }
+        i += len;
+    }
+    if (!nvars) goto done;
+    // the globals added before the first function: two constants, gl_PointCoord, and the Private pointer types not yet
+    // declared (a filled variable's goes right before the variable, below; an access chain's is only used in a function)
+    uint32_t extra[MAX_PRIV * 4 + 32], ne = 0, c0 = bound++, c1 = bound++, pc_ptr = 0, pc_var = 0;
+    uint8_t declared[MAX_PRIV] = {0};
+    extra[ne++] = 4u << 16 | SPV_OP_CONSTANT, extra[ne++] = f32, extra[ne++] = c0, extra[ne++] = 0;
+    extra[ne++] = 4u << 16 | SPV_OP_CONSTANT, extra[ne++] = f32, extra[ne++] = c1, extra[ne++] = 0x3f800000;
+    if (points) {
+        if (!v2) v2 = bound++, extra[ne++] = 4u << 16 | SPV_OP_TYPE_VECTOR, extra[ne++] = v2, extra[ne++] = f32, extra[ne++] = 2;
+        pc_ptr = bound++, pc_var = bound++;
+        extra[ne++] = 4u << 16 | OP_TYPE_POINTER, extra[ne++] = pc_ptr, extra[ne++] = SC_INPUT, extra[ne++] = v2;
+        extra[ne++] = 4u << 16 | SPV_OP_VARIABLE, extra[ne++] = pc_ptr, extra[ne++] = pc_var, extra[ne++] = SC_INPUT;
+    }
+    o = malloc((n + ne + (uint64_t)npriv * 4 + 16 + (uint64_t)nvars * 12 + 32) * 4);
+    if (!o) goto done;
+    uint32_t *p = o;
+    memcpy(p, w, 5 * 4), p += 5;
+    int in_entry = 0, stored = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        if (i == fn_at) {
+            for (uint32_t k = 0; k < npriv; k++)
+                if (!declared[k]) *p++ = 4u << 16 | OP_TYPE_POINTER, *p++ = priv[k][1], *p++ = SC_PRIVATE, *p++ = pt_type[priv[k][0]];
+            memcpy(p, extra, ne * 4), p += ne;
+        }
+        if (i == ep_at) {   // the interface: filled variables out before SPIR-V 1.4 (Private is not listed), gl_PointCoord in
+            uint32_t *head = p, name_words = (uint32_t)(strnlen((const char *)(a + 2), (len - 3) * 4) / 4 + 1);
+            for (uint32_t k = 0; k < len; k++) {
+                uint32_t v = w[i + k];
+                if (k >= 3 + name_words && v < old_bound && fill[v] == 1 && w[1] < 0x00010400) continue;
+                *p++ = v;
+            }
+            if (pc_var) *p++ = pc_var;
+            *head = (uint32_t)(p - head) << 16 | SPV_OP_ENTRY_POINT;
+            i += len;
+            continue;
+        }
+        if ((op == SPV_OP_DECORATE || op == OP_DECORATE_ID) && len >= 3 && a[0] < old_bound && fill[a[0]] == 1) {
+            i += len;   // Location, Flat and the like belong to Input variables
+            if (i == ann_end && pc_var)
+                *p++ = 4u << 16 | SPV_OP_DECORATE, *p++ = pc_var, *p++ = SPV_DEC_BUILTIN, *p++ = BUILTIN_POINT_COORD;
+            continue;
+        }
+        if (op == SPV_OP_VARIABLE && len >= 4 && a[1] < old_bound && fill[a[1]] == 1)   // its pointer type first
+            for (uint32_t k = 0; k < npriv; k++)
+                if (priv[k][0] == a[0] && !declared[k])
+                    declared[k] = 1, *p++ = 4u << 16 | OP_TYPE_POINTER, *p++ = priv[k][1], *p++ = SC_PRIVATE, *p++ = pt_type[priv[k][0]];
+        memcpy(p, w + i, len * 4);
+        if ((op == SPV_OP_VARIABLE || op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 4 &&
+            a[1] < old_bound && fill[a[1]]) {
+            for (uint32_t k = 0; k < npriv; k++)
+                if (priv[k][0] == a[0]) p[1] = priv[k][1];
+            if (op == SPV_OP_VARIABLE) p[3] = SC_PRIVATE;
+        }
+        p += len;
+        if (i + len == ann_end && pc_var)   // gl_PointCoord's BuiltIn after the last decoration
+            *p++ = 4u << 16 | SPV_OP_DECORATE, *p++ = pc_var, *p++ = SPV_DEC_BUILTIN, *p++ = BUILTIN_POINT_COORD;
+        if (op == SPV_OP_FUNCTION && len >= 5) in_entry = a[1] == entry;
+        i += len;
+        if (op == OP_LABEL && in_entry && !stored) {   // the entry's first block: its OpVariables, then the stores
+            while (i < n && (w[i] & 0xffff) == SPV_OP_VARIABLE) memcpy(p, w + i, (w[i] >> 16) * 4), p += w[i] >> 16, i += w[i] >> 16;
+            uint32_t sx = c0, sy = c0;
+            if (pc_var) {
+                uint32_t pc = bound++;
+                sx = bound++, sy = bound++;
+                *p++ = 4u << 16 | OP_LOAD, *p++ = v2, *p++ = pc, *p++ = pc_var;
+                *p++ = 5u << 16 | OP_COMPOSITE_EXTRACT, *p++ = f32, *p++ = sx, *p++ = pc, *p++ = 0;
+                *p++ = 5u << 16 | OP_COMPOSITE_EXTRACT, *p++ = f32, *p++ = sy, *p++ = pc, *p++ = 1;
+            }
+            for (uint32_t k = 0; k < nvars; k++) {
+                uint32_t t = vtype[k], c = t == f32 ? 1 : vec_n[t], comp[4] = {sx, sy, c0, c1}, val = comp[0];
+                if (c > 1) {
+                    val = bound++;
+                    *p++ = (3 + c) << 16 | OP_COMPOSITE_CONSTRUCT, *p++ = t, *p++ = val;
+                    for (uint32_t q = 0; q < c; q++) *p++ = comp[q];   // x y z w in order: (s, t, 0, 1) or (0, 0, 0, 1)
+                }
+                *p++ = 3u << 16 | OP_STORE, *p++ = vars[k], *p++ = val;
+            }
+            stored = 1;
+        }
+    }
+    if (!stored) { free(o), o = NULL; goto done; }
+    o[3] = bound;
+    *out_n = (uint64_t)(p - o);
+done:
+    free(pt_type), free(vec_comp), free(vec_n), free(loc), free(fill);
     return o;
 }
 
@@ -2637,15 +2833,19 @@ static int is_src1(unsigned f) { return f >= NVN_BLEND_FUNC_SRC1_COLOR && f <= N
 // Runs per draw (gkey_fill, target_wmask): only the blend factors of blend-enabled targets are read until one is SRC1,
 // which NX2navi never sets (0 of 876 pipelines in the field and fight saves).
 // NX2NAVI_VK_NOOPT=1: pipelines built without the driver's optimiser, for a driver whose shader compiler crashes on
-// one (the test switch for such a report); slower shaders, the same picture.
-static VkPipelineCreateFlags noopt_flag(void) {
+// one (the test switch for such a report); slower shaders, the same picture. mesh: only pipelines with task and mesh
+// stages, the foliage's, whose optimiser is the suspect in device losses some minutes into a forest on AMD GPUs.
+static VkPipelineCreateFlags noopt_flag_for(int mesh) {
     static int on = -1;
     if (on < 0) {
-        on = cfg_int("NX2NAVI_VK_NOOPT") != 0;
-        if (on) rt_log("vk_pipeline: pipelines built without the driver's optimiser (NX2NAVI_VK_NOOPT)");
+        const char *v = cfg_value("NX2NAVI_VK_NOOPT");
+        on = !strcmp(v, "mesh") ? 2 : strcmp(v, "0") != 0;
+        if (on) rt_log("vk_pipeline: %s built without the driver's optimiser (NX2NAVI_VK_NOOPT)",
+                       on == 2 ? "pipelines with task and mesh stages" : "pipelines");
     }
-    return on ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
+    return on == 1 || (on == 2 && mesh) ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
 }
+static VkPipelineCreateFlags noopt_flag(void) { return noopt_flag_for(0); }
 
 // ---- pipeline creation feedback (NX2NAVI_PIPE_FEEDBACK, default 1; 0 off)
 // Each pipeline, library and compute build asks the driver whether pipeline-cache.bin (P.cache) held it
@@ -2827,24 +3027,33 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     if (s->fs) {
         GfxShaderIo fin[32], vout[32];
-        uint32_t need = gfx_shader_inputs(s->fs, fin), have = mesh ? ~0u : gfx_shader_outputs(s->vs, vout), missing = 0;
+        // a mesh stage's outputs from its module (spirv_mesh_outputs): the translation reflects none
+        int points = 0;
+        uint32_t need = gfx_shader_inputs(s->fs, fin), missing = 0,
+                 have = mesh ? (vcode ? spirv_mesh_outputs(vcode, vw, &points) : ~0u) : gfx_shader_outputs(s->vs, vout);
         for (int i = 0; i < 32; i++) {
             if (!(need >> i & 1) || fin[i].packed) continue;
             if (!(have >> i & 1)) missing |= 1u << i;
             else if (!mesh && vout[i].type != fin[i].type)
                 LOG_ONCE("vk_pipeline: varying %d is type %d in the vertex stage, %d in the fragment stage", i, vout[i].type, fin[i].type);
         }
-        if (missing && !l->set1) {
+        if (missing && !l->set1 && !mesh) {
             uint64_t n2 = 0;
             vpatched = spirv_add_outputs(vcode, vw, missing, fin, &n2);
             if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);
             else vcode = vpatched, vw = n2;
         }
         const uint32_t *fcode = gfx_shader_spirv(s->fs, &fw);
+        if (missing && mesh && fcode) {   // inputs no mesh output feeds read as Maxwell gives them (spirv_fs_fill_inputs)
+            uint64_t n2 = 0;
+            uint32_t *f = spirv_fs_fill_inputs(fcode, fw, missing, points, &n2);
+            if (f) fcode = fpatched = f, fw = n2;
+            else LOG_ONCE("vk_pipeline: cannot fill fragment inputs the mesh stage lacks (mask %#x)", missing);
+        }
         if (k->dsb) {
             uint64_t n2 = 0;
             uint32_t *d = spirv_dual_source(fcode, fw, &n2);
-            if (d) fcode = fpatched = d, fw = n2;
+            if (d) free(fpatched), fcode = fpatched = d, fw = n2;
             else LOG_ONCE("vk_pipeline: SRC1 blend factors but the fragment shader writes no colour output 1");
         }
         if (l->set1 || fs_off) {
@@ -2941,7 +3150,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
                                        .stageCount = n_stages, .pStages = stages, .pVertexInputState = mesh ? NULL : &vi,
                                        .pInputAssemblyState = mesh ? NULL : &ia, .pViewportState = &vp, .pRasterizationState = &rs,
                                        .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
-                                       .pDynamicState = &dy, .layout = l->layout, .flags = noopt_flag()};
+                                       .pDynamicState = &dy, .layout = l->layout, .flags = noopt_flag_for(mesh)};
     if (k->fbl & 1) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     if (k->fbl & 2) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     VkPipelineCreationFeedbackCreateInfo fci;
@@ -2950,6 +3159,15 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     uint64_t p0 = perf_begin();
     crash_note("a graphics pipeline", s->vs, s->fs, s->ts);
     VkResult r = pipe_create(0, &pi, &pipe);
+    if (r == VK_ERROR_UNKNOWN && !(pi.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
+        // A compiler that gives up on a pipeline (AMD's Windows driver answers VK_ERROR_UNKNOWN) may still build it
+        // without its optimiser: one more try that way, slower shaders for that pipeline instead of a draw left out.
+        static int told;
+        if (!told++) rt_log("vk_pipeline: the driver could not build a graphics pipeline (VK_ERROR_UNKNOWN): built again "
+                            "without its optimiser (logged once)");
+        pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        r = pipe_create(0, &pi, &pipe);
+    }
     plat_crash_context(NULL);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
     if (r != VK_SUCCESS) {
@@ -4415,8 +4633,11 @@ static int id_cmp(const void *x, const void *y) { return memcmp(x, y, 32); }
 // bookkeeping). Jobs left queued at K.until stay for the pool. So do those the memory gate refuses (gate_enter): a
 // builder it refuses ends, which leaves fewer builders compiling side by side while the others' reservations stand,
 // and none when the machine has no room; the pool builds what is left during play, when the gate lets it.
+// arg non-NULL: one job at most. The builders start with one pipeline built alone on the starting thread:
+// a driver's first graphics pipeline sets up its compiler, and NVIDIA's 621.14 was reported to fault in a sizable
+// share of starts when every builder began its first pipeline at the same moment.
 static void warm_builder(void *arg) {
-    (void)arg;
+    int one = arg != NULL;
     plat_mutex_lock(&P.lock);
     while (A.low && !(K.until && now_ms() >= K.until)) {
         double held;
@@ -4454,6 +4675,7 @@ static void warm_builder(void *arg) {
         plat_cond_broadcast(&done_cv);
         free(j);
         gate_leave(held);
+        if (one) break;
     }
     plat_mutex_unlock(&P.lock);
     return;
@@ -4609,6 +4831,7 @@ static int prewarm_run(int offline) {
     K.until = !offline && P.gpl && !(full && !strcmp(full, "1")) ? now_ms() + PREWARM_PIPE_MS : 0;
     PlatThread *t[64];
     int nt = 0;
+    if (queued) warm_builder((void *)1);   // the first alone (warm_builder)
     for (int i = 0; i < cpus && i < 64 && queued; i++)
         if ((t[nt] = plat_thread_new(warm_builder, NULL, "pipe prewarm"))) nt++;
     if (!nt) warm_builder(NULL);
@@ -4947,9 +5170,24 @@ static struct {
     volatile int32_t kept;                                // libraries entered in libs[] so far
     int32_t keep_n;
     int idle;                                          // build at PLAT_PRIO_IDLE (boot), normal (preparation)
+    int tail_one;                                      // automatic boot policy: only worker 0 takes the warming tail
     PlatMutex stat;
 } LB = {.stat = PLAT_MUTEX_INIT};
 static __thread int lb_me = -1;        // on a boot prebuild thread (lb_worker): its index in LB.th
+
+// Claim a boot job without dropping one when the extra workers finish the recent-pipeline prefix. Recent pipelines
+// retain parallel creation; a single worker continues the complete tail. Explicit thread counts override this
+// policy, and installer preparation uses its own queue at full concurrency. The CAS makes the prefix boundary
+// exact even when two workers reach it together. No pipeline creation or dispatch waits on this queue lock.
+static size_t lb_next(int worker) {
+    int64_t next = __atomic_load_n(&LB.next, __ATOMIC_RELAXED);
+    for (;;) {
+        if (LB.stop || (size_t)next >= LB.n ||
+            (LB.idle && LB.tail_one && worker > 0 && (size_t)next >= LB.n_keep)) return LB.n;
+        if (__atomic_compare_exchange_n(&LB.next, &next, next + 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return (size_t)next;
+    }
+}
 
 // ---- preparation that outlives a driver crash. A bug in the driver's shader compiler can kill the process inside
 // vkCreate*Pipelines: NVIDIA 615.78.08 on an RTX 5080 crashed on the same vertex library at the same point of every
@@ -5867,8 +6105,8 @@ static void lb_worker(void *arg) {
     lb_me = (int)(intptr_t)arg;        // its handle is LB.th[lb_me]
     plat_thread_priority(PLAT_PRIO_IDLE);
     for (;;) {
-        size_t i = (size_t)plat_inc64(&LB.next) - 1;
-        if (i >= LB.n || LB.stop) break;
+        size_t i = lb_next(lb_me);
+        if (i >= LB.n) break;
         if (skip_listed(LB.e[i].iid)) {
             skip_count();
             plat_mutex_lock(&LB.stat);
@@ -6172,7 +6410,13 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     // finished after 34,000 frames, and lib_prebuild = 0 took it to 5% and the game to its frame limit (RTX 4080 SUPER,
     // driver 617.14, 2026-11-08). With the driver's disk cache warm (--prepare-shaders, --warm-shaders) a build takes
     // well under a millisecond, so two threads still finish the list quickly.
+    // The two take the shaders dispatched most recently (e[0..n_keep)); one goes on with the rest (lb_next), which is
+    // only built into the caches. Where the rest still runs during play, two builders there cost frames: one against
+    // two for the whole list, one 20 s route each on an RTX 5090, Castle Town 76.1 against 73.7 fps with 1 frame over
+    // 25 ms against 6, Hyrule Field 85.7 against 80.7 fps. NX2NAVI_LIB_PREBUILD_THREADS keeps its count for the whole
+    // list.
     int t = te && *te ? atoi(te) : (cpus < 4 ? 1 : 2);   // idle priority; a cold driver takes ~2 s per large compute shader
+    LB.tail_one = !(te && *te);
     t = t < 1 ? 1 : t > LB_MAX_THREADS ? LB_MAX_THREADS : t;
     if ((size_t)t > n) t = (int)n;
     LB.t0 = now_ms();
@@ -6192,6 +6436,9 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
            "threads; library state clamp %u, polygon mode %u, depth -w..w %u, samples %u; %s (NX2NAVI_LIB_PREBUILD_BIG)",
            n_cs < n ? n_cs : n, LB.n_keep, n > n_cs ? n - n_cs : 0, LB.keep_n, started, LB.clamp, LB.poly, LB.minus_w,
            LB.samples, big);
+    if (LB.tail_one && started > 1)
+        rt_log("vk_pipeline: stage library prebuild: after the %zu recent compute pipelines, one worker continues the "
+               "remaining list; NX2NAVI_LIB_PREBUILD_THREADS overrides this background limit", LB.n_keep);
 }
 
 static void lb_stop(void) {
@@ -6326,15 +6573,18 @@ static int lb_warm_prepared(const char *dir, int offline) {
 // NX2NAVI_PREPARE_PIPELINES: mesh (default) builds the list's mesh pipelines only; all, every record; 0, none. A
 // vertex pipeline is linked from its prepared stage libraries in 2 to 6 ms when a draw misses it, and its module
 // depends on the vertex output union of the pairs this install has recorded (vs_outs), so one built here is not
-// certain to be the one a draw asks for.
+// certain to be the one a draw asks for. Without the graphics pipeline library (vk_caps_gpl: AMD's Windows driver for
+// RDNA 2 and older) neither holds: a vertex pipeline a draw misses is compiled whole while that draw is left out, and
+// its vertex outputs come from its own pair (no independent layouts), so a listed one is the one the draw asks for.
+// There mesh builds every record too.
 // A driver whose compiler crashes on one of these would crash at every preparation: seed-pipelines-running.txt marks
 // the step, and a run that finds the marker of a run that died skips the step for good on this folder (the pipelines
 // are then built at their first draw, as without a list) until the marker is deleted.
-static int cache_save(uint32_t wait_ms);
+static int cache_save(uint32_t wait_ms, int exiting);
 
 static int seed_pipelines(const char *dir) {
     const char *mode = cfg_value("NX2NAVI_PREPARE_PIPELINES");
-    int all = !strcmp(mode, "all");
+    int all = !strcmp(mode, "all") || (!strcmp(mode, "mesh") && !P.gpl);
     char path[PLAT_PATH_MAX * 2 + 48], mark[PLAT_PATH_MAX * 2 + 48];
     snprintf(path, sizeof path, "%s/seed-pipeline-keys.bin", dir);
     snprintf(mark, sizeof mark, "%s/seed-pipelines-running.txt", dir);
@@ -6430,6 +6680,7 @@ static int seed_pipelines(const char *dir) {
     free(ids), free(sh), free(r);
     PlatThread *th[64];
     int nt = 0;
+    if (queued) warm_builder((void *)1);   // the first alone (warm_builder)
     for (int i = 0; i < cpus && i < 64 && queued; i++)
         if ((th[nt] = plat_thread_new(warm_builder, NULL, "pipe list"))) nt++;
     if (!nt && queued) warm_builder(NULL);
@@ -6444,13 +6695,14 @@ static int seed_pipelines(const char *dir) {
     while (K.left) plat_cond_wait(&done_cv, &P.lock);   // those a pool worker took
     uint32_t built = K.built - built0, failed = K.failed - failed0;
     plat_mutex_unlock(&P.lock);
-    int saved = cache_save(5000) > 0;   // as a save at exit: it waits that long for a moment with no build running
+    int saved = cache_save(5000, 0) > 0;   // explicit preparation waits for a moment with no build running
     plat_file_delete(mark);
     char msg[640];
     snprintf(msg, sizeof msg, "prepare-pipelines: %zu listed pipelines: %u built (%u mesh), %u failed, %u the same as one "
              "built before, %u without a shader this game version or its shader cache has, %u vertex pipelines left to "
              "their first draw (NX2NAVI_PREPARE_PIPELINES=%s), %u mesh pipelines this GPU cannot draw; on %d threads in "
-             "%.0f ms; pipeline cache %s", n, built, mesh, failed, known, dropped, other, all ? "all" : "mesh", no_mesh,
+             "%.0f ms; pipeline cache %s", n, built, mesh, failed, known, dropped, other,
+             !strcmp(mode, "all") ? "all" : all ? "mesh, every record without the graphics pipeline library" : "mesh", no_mesh,
              nt ? nt : 1, now_ms() - t0,
              saved ? "saved" : "not saved (builds kept running, or its file could not be written)");
     printf("%s\n", msg);
@@ -6803,16 +7055,21 @@ static PlatMutex save_lock = PLAT_MUTEX_INIT;   // one cache save at a time; shu
 // every save copied and wrote the whole cache whenever a pipeline had been created since the last one, also when the
 // cache had held it: three saves of 358.1 MB in one run that added 0.3 MB (2026-11-11).
 // The lock is only ever tried, never waited for: a waiting exclusive request would hold back every new build
-// (a shared request queues behind it), so a pending save could stall the replay. wait_ms: how long to keep trying
-// while builds run (0: one try). Returns 0 when no build-free moment came, -1 when the data could not be copied or
-// its file not written (the log says which), 1 otherwise (saved, or nothing to save).
-static int cache_save_one(int which, uint32_t wait_ms) {
+// (a shared request queues behind it), so a pending autosave could stall the replay. The save at exit (exiting) holds
+// new builds back instead (cache_saving_at_exit) and so only waits for the builds already running. wait_ms: how long to
+// keep trying while builds run (0: one try). Returns 0 when no build-free moment came, -1 when the data could not be
+// copied or its file not written (the log says which), 1 otherwise (saved, or nothing to save).
+static int cache_save_one(int which, uint32_t wait_ms, int exiting) {
     VkPipelineCache cache = which ? P.play : P.cache;
     const char *path = which ? P.play_path : P.cache_path;
     if (!cache) return 1;
     uint64_t until = plat_now_ms() + wait_ms;
+    if (exiting) __atomic_store_n(&cache_saving_at_exit, 1, __ATOMIC_RELEASE);
     while (!plat_mutex_trylock(&cache_rw)) {
-        if (plat_now_ms() >= until) return 0;
+        if (plat_now_ms() >= until) {
+            if (exiting) __atomic_store_n(&cache_saving_at_exit, 0, __ATOMIC_RELEASE);
+            return 0;
+        }
         plat_sleep_ms(2);
     }
     size_t size = 0;
@@ -6821,8 +7078,10 @@ static int cache_save_one(int which, uint32_t wait_ms) {
     int same = sized && size == P.saved[which];
     int got = sized && !same && (data = malloc(size)) && vkGetPipelineCacheData(P.device, cache, &size, data) == VK_SUCCESS;
     plat_mutex_unlock(&cache_rw);
+    // The held-back builds go on before the log line and the file write: one of them may hold a lock those wait for.
+    if (exiting) __atomic_store_n(&cache_saving_at_exit, 0, __ATOMIC_RELEASE);
     static uint64_t skipped[2];
-    int failed = sized && !same && !got;
+    int failed = !sized || (!same && !got);
     if (same) skipped[which]++;
     if (failed) rt_log("vk_pipeline: %s not saved: no copy of its %.1f MB", path, size / 1048576.0);
     if (got) {
@@ -6854,7 +7113,7 @@ static int cache_save_one(int which, uint32_t wait_ms) {
 }
 
 // Both caches' saves (cache_save_one): 1 when each is done, 0 when one found no build-free moment, -1 when one failed.
-static int cache_save(uint32_t wait_ms) {
+static int cache_save(uint32_t wait_ms, int exiting) {
     if (!P.ready || !P.cache || !P.cache_path[0]) return 1;
     // Not under P.lock: holding P.lock through the copy and the file write (about 60 ms on the 1.4.3 fight) stopped
     // every pipeline lookup of the replay, a freeze at each 20 s autosave.
@@ -6864,8 +7123,8 @@ static int cache_save(uint32_t wait_ms) {
         return 1;
     }
     int ok = 1, r;
-    if (!P.play || P.fold) ok = cache_save_one(0, wait_ms);
-    if (P.play && (r = cache_save_one(1, wait_ms)) < ok) ok = r;   // the worse of the two
+    if (!P.play || P.fold) ok = cache_save_one(0, wait_ms, exiting);
+    if (P.play && (r = cache_save_one(1, wait_ms, exiting)) < ok) ok = r;   // the worse of the two
     plat_mutex_unlock(&save_lock);
     return ok;
 }
@@ -6874,7 +7133,7 @@ static int cache_save(uint32_t wait_ms) {
 #define SAVE_WAIT_MS 5000
 
 // Returns cache_save's answer.
-static int save_with(uint32_t wait_ms) {
+static int save_with(uint32_t wait_ms, int exiting) {
     if (P.ready) keys_flush(), pb_flush(), cu_flush(), cf_log();
     if (P.ready && P.gpl) {
         rt_log("vk_pipeline: gpl: %llu fast links (%llu by workers, %llu of those by the library workers for skipped draws; "
@@ -6929,16 +7188,22 @@ static int save_with(uint32_t wait_ms) {
     }
     gfx_shader_record_flush(1);
     if (P.ready && !P.cache) pb_log("at a save");   // with P.cache the line comes with its own save below
-    int saved = cache_save(wait_ms);
+    int saved = cache_save(wait_ms, exiting);
     if (!saved && wait_ms)
         rt_log("vk_pipeline: %s not saved: pipeline builds kept running for %u ms", P.play ? P.play_path : P.cache_path,
                (unsigned)wait_ms);
     return saved;
 }
 
-// The save at exit and after the shader preparation: it waits up to SAVE_WAIT_MS for a moment with no build running.
+// The save after the shader preparation and at shutdown: it waits up to SAVE_WAIT_MS for a moment with no build running.
 void vk_pipeline_save(void) {
-    save_with(SAVE_WAIT_MS);
+    save_with(SAVE_WAIT_MS, 0);
+}
+
+// The save as the process ends (window closed, the game's exit, a timed run's end): new builds wait while it waits up to
+// SAVE_WAIT_MS for the running ones to finish (cache_saving_at_exit).
+void vk_pipeline_save_exit(void) {
+    save_with(SAVE_WAIT_MS, 1);
 }
 
 // The game never shuts the device down (boot.c and the window end the process), so the cache is saved while it
@@ -6967,7 +7232,7 @@ static void autosave_once(void) {
         if (!plat_mutex_trylock(&cache_rw)) return;
         plat_mutex_unlock(&cache_rw);
     }
-    if (save_tried(&sr, n, now, save_with(0) > 0))
+    if (save_tried(&sr, n, now, save_with(0, 0) > 0))
         rt_log("vk_pipeline: the pipeline cache was not saved in %d tries in a row; the next try is made when a new "
                "pipeline is built, or at exit", SAVE_RETRIES + 1);
 }

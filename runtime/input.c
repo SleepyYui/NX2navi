@@ -498,16 +498,13 @@ static int sdl_enter(void) {
 
 static void sdl_leave(void) { plat_mutex_unlock(&sdl_lock); }
 
-static void stick(SDL_GamepadAxis ax, SDL_GamepadAxis ay, float dead, int32_t out[2]) {
-    input_pad_stick(SDL_GetGamepadAxis(pad, ax), -(int32_t)SDL_GetGamepadAxis(pad, ay), dead, out);
-}
-
 // Every connected gamepad is kept open; `pad` is the one the game reads (and the one that rumbles and feeds motion):
 // the first one found, then whichever one the player presses (pad_follow). Taking only the first gamepad SDL lists
 // left the game deaf when that one was a device nobody holds: a virtual pad of Steam Input or DS4Windows, a wheel, a
 // receiver's idle second slot, listed before the controller in the player's hands.
 enum { MAX_PADS = 8 };
 static SDL_Gamepad *pads[MAX_PADS];
+static uint8_t pad_rest[MAX_PADS];   // per open gamepad, bit a: axis a has been seen at rest (pad_axis)
 static int npads;
 static int pad_pressed_logged;       // the primary's first press was logged (once per primary)
 
@@ -552,7 +549,8 @@ static void scan_pads(void) {
             for (int k = 0; k < 4; k++) plat_xchg32(&pad_labels[k], PAD_LABEL_NONE);
         }
         SDL_CloseGamepad(pads[i]);
-        pads[i] = pads[--npads];
+        --npads;
+        pads[i] = pads[npads], pad_rest[i] = pad_rest[npads];
     }
     int n = 0;
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
@@ -562,6 +560,7 @@ static void scan_pads(void) {
         if (open) continue;
         SDL_Gamepad *p = SDL_OpenGamepad(ids[i]);
         if (!p) { rt_log("input: gamepad %u could not be opened (%s)", (unsigned)ids[i], SDL_GetError()); continue; }
+        pad_rest[npads] = 0;
         pads[npads++] = p;
         if (pad) rt_log("input: gamepad \"%s\" connected (the game switches to it at its first press)", SDL_GetGamepadName(p));
     }
@@ -573,12 +572,35 @@ static void scan_pads(void) {
     }
 }
 
-// Under lock: 1 when p has a button down, a trigger pulled or a stick past half way (a drifting stick does not count).
+// Under lock: axis a of open gamepad p, or 0 until the axis has been seen at rest (within a quarter of its range of the
+// middle; a trigger's rest is 0). A device that reports an axis held from the start (a virtual pad nobody holds, a
+// trigger or pedal mapped onto a stick, a stick that rests far off its middle) would otherwise turn the camera on its
+// own, and, counted as pressed, take the gamepad role from the controller in the player's hands for good (pad_follow).
+// A stick the player holds at the start counts once it has been let go.
+enum { AXIS_REST = 8192 };
+static int16_t pad_axis(SDL_Gamepad *p, SDL_GamepadAxis a) {
+    int16_t v = SDL_GetGamepadAxis(p, a);
+    for (int i = 0; i < npads; i++) {
+        if (pads[i] != p) continue;
+        if (pad_rest[i] >> a & 1) return v;
+        if (abs(v) >= AXIS_REST) return 0;
+        pad_rest[i] |= (uint8_t)(1u << a);
+        return v;
+    }
+    return v;
+}
+
+static void stick(SDL_GamepadAxis ax, SDL_GamepadAxis ay, float dead, int32_t out[2]) {
+    input_pad_stick(pad_axis(pad, ax), -(int32_t)pad_axis(pad, ay), dead, out);
+}
+
+// Under lock: 1 when p has a button down, a trigger pulled or a stick past half way (a drifting stick does not count,
+// nor an axis not yet seen at rest).
 static int pad_active(SDL_Gamepad *p) {
     for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++)
         if (SDL_GetGamepadButton(p, (SDL_GamepadButton)b)) return 1;
     for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; a++)
-        if (abs(SDL_GetGamepadAxis(p, (SDL_GamepadAxis)a)) > PAD_USED) return 1;
+        if (abs(pad_axis(p, (SDL_GamepadAxis)a)) > PAD_USED) return 1;
     return 0;
 }
 
@@ -738,8 +760,8 @@ static int pad_physical(uint8_t pd[PAD_COUNT]) {
     pad_follow();
     if (!pad || !SDL_GamepadConnected(pad)) return 0;
     for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
-    pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
-    pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
+    pd[PAD_ZL] = pad_axis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
+    pd[PAD_ZR] = pad_axis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
     for (int p = PAD_ZR + 1; p < PAD_COUNT; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);   // false without paddles
     if (!pad_pressed_logged) {   // once per primary: the log then shows that its presses arrive
         for (int p = PAD_SOUTH; p < PAD_COUNT && !pad_pressed_logged; p++)
@@ -883,10 +905,8 @@ int input_pad_stick_percent(double pct[2]) {
     } else
 #endif
     if (sdl_pad) {   // the game's poll keeps the state fresh (sdl_enter)
-        pct[0] = input_stick_percent(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX),
-                                     SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
-        pct[1] = input_stick_percent(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX),
-                                     SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY));
+        pct[0] = input_stick_percent(pad_axis(pad, SDL_GAMEPAD_AXIS_LEFTX), pad_axis(pad, SDL_GAMEPAD_AXIS_LEFTY));
+        pct[1] = input_stick_percent(pad_axis(pad, SDL_GAMEPAD_AXIS_RIGHTX), pad_axis(pad, SDL_GAMEPAD_AXIS_RIGHTY));
         ok = 1;
     }
     if (in) sdl_leave();

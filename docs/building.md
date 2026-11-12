@@ -452,6 +452,14 @@ A change to the mouse camera's stick deflection (`runtime/input_map.c` `input_mo
 deflection at each camera speed: a slow movement is divided by the factor, a fast flick reaches full tilt. No game
 files.
 
+A change to how a gamepad's axes are read (`runtime/input.c` `pad_axis`: an axis counts once it has been seen at rest)
+passes `python tests\pad_rest_check.py`, which builds that function with stand-ins for SDL. No game files.
+
+A change to how a mesh pipeline's fragment module gets the inputs no mesh output feeds (`runtime/vk_pipeline.c`
+`spirv_mesh_outputs`, `spirv_fs_fill_inputs`) passes `python tests\fs_fill_inputs_check.py`, which builds both
+functions and runs them on mesh and fragment shaders it compiles with glslang, then validates the result. No game
+files.
+
 A change to which render passes count as drawn frame after frame (`runtime/vk_target_frames.h`: a draw into one is
 skipped while its pipeline builds, a draw into any other waits) passes `python tests\target_frames_check.py`, which
 builds the header alone and replays an area change after a loading screen from a player's log: the scene, probe and

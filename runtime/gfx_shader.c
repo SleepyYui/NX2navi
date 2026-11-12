@@ -1527,6 +1527,11 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         memcpy(&magic0, control, 4);
         if (!shared && magic0 == 0x98761234u && !strcmp(stage, "cs")) memcpy(&shared, control + 0x64, 4);
         o += sprintf(o, "},\"shared\":%u", shared);
+        // Their local memory, bytes a thread, follows at +0x68. Without it the translator declares its 0x1000-byte
+        // default: one compute program of the game needs 4,752 bytes a thread and indexed past the end of its array.
+        uint32_t local = 0;
+        if (magic0 == 0x98761234u && !strcmp(stage, "cs")) memcpy(&local, control + 0x68, 4);
+        if (local && local <= (1u << 20)) o += sprintf(o, ",\"local_mem\":%u", local);
     }
     if (!strcmp(stage, "cs")) {
         uint32_t l[3] = {1, 1, 1};

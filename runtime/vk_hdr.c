@@ -1,12 +1,10 @@
 // HDR output (NX2NAVI_HDR=1): an HDR10 swapchain (Rec. 2020 primaries, PQ) and a game picture tone mapped to the
-// display's range. Settings: NX2NAVI_HDR, off and the tone mapper following the menu during a run (vk_hdr_wanted), the
-// game's own HDR (native) from the start only; the nits NX2NAVI_HDR_PEAK_NITS (the display's peak),
-// NX2NAVI_HDR_GAME_NITS (the picture's white, "paper white") and NX2NAVI_HDR_UI_NITS (the HUD's and this menu's white);
-// NX2NAVI_HDR_TONEMAP with what each tone mapper takes (NX2NAVI_HDR_MIDGRAY, NX2NAVI_HDR_MATCH_SLOPE,
-// NX2NAVI_HDR_TONE_SLOPE and NX2NAVI_HDR_HUE_CLIP, or NX2NAVI_HDR_GAMMA and NX2NAVI_HDR_HIGHLIGHT_SAT ..
-// NX2NAVI_HDR_GRADE) and the grading sliders NX2NAVI_HDR_EXPOSURE .. NX2NAVI_HDR_SATURATION of both, all read
-// when the settings change (vk_hdr_support). With NX2NAVI_HDR=0 the swapchain is SDR, the spliced tonemap gives the
-// game's own SDR picture (vk_hdr_support, p0.w = -1) and the present is what it was.
+// display's range, one fixed look (shaders/hdr_tonemap.frag says which). Settings: NX2NAVI_HDR, on and off following
+// the menu during a run (vk_hdr_wanted), the game's own HDR (native, the menu's other HDR) from the start only; and
+// the nits NX2NAVI_HDR_PEAK_NITS (the display's peak), NX2NAVI_HDR_GAME_NITS (the picture's white, "paper white") and
+// NX2NAVI_HDR_UI_NITS (the HUD's and this menu's white), read when the settings change (vk_hdr_support). With
+// NX2NAVI_HDR=0 the swapchain is SDR, the spliced tonemap gives the game's own SDR picture (vk_hdr_support, p0.w = -1)
+// and the present is what it was.
 //
 // The game's picture (docs/architecture.md, "HDR"). The game tonemaps its scene into an r11g11b10f target, upscales it
 // and draws the HUD into a second one (float, nothing in these passes clamps), and one last draw copies that into the
@@ -14,9 +12,8 @@
 // 1. vk_hdr_shader_swap, on each fragment shader as it loads (in memory only; the cache keeps the translator's): 1.1.1's
 //    tonemap ends in the fitted ACES curve and a clamp to 0..1 per channel. tonemap_splice links the function
 //    nx_tonemap of shaders/hdr_tonemap.frag into that shader and stores its result in place of the three clamped
-//    channels: the scene mapped onto the display by the tone mapper chosen (that file says how each does it), from the
-//    values the curve takes and the scene before the game's exposure gain, with the settings in five vec4 the support
-//    buffer gains at 1440. Recognised by the curve's constants, not by a hash, so
+//    channels: the scene mapped onto the display (that file says how), from the values the curve takes and the scene
+//    before the game's exposure gain, with the settings in a vec4 the support buffer gains at 1440. Recognised by the curve's constants, not by a hash, so
 //    another translator still finds it. The game's FSR 1 upscale after it would clamp the picture to 1 again;
 //    fsr_unclamp drops that clamp in its SPIR-V.
 // 2. vk_hdr_draw / vk_hdr_present_source: a draw into a presented window texture that samples one float texture of
@@ -103,10 +100,17 @@ void vk_hdr_off(void) { g_native = 0, g_armed = 0; }
 
 // The settings, read again when they change. The replay (every draw's support buffer) and the present thread read
 // them: an update fills the snapshot not in use and then publishes it.
+// The game's picture is graded for a display of gamma about 2.2, and its sRGB encode is linear near black: shown as
+// that encode decodes, its darkest tones sit up to a hundred times above where such a display puts them (a scene
+// value of 0.001, 0.08 nits at a white of 350 nits against 0.001), the floor of a dark scene lifted to grey. So the
+// present shows the picture as a 2.2 display would (hdr_encode.comp, hdr_ui.frag: the power 2.2 of the sRGB code),
+// and the tonemap aims its peak below the display's by that correction's inverse (hdr_tonemap.frag nx_tonemap).
+#define HDR_GAMMA 1.0f   // the present's correction: 0 none, 1: 2.2, 2: 2.4
+
 typedef struct {
     float peak, game, ui;   // nits
-    float gamma;            // 0 none, 1: 2.2, 2: 2.4 (the present's correction, hdr_encode.comp)
-    float tm[20];           // the support buffer's five vec4 (shaders/hdr_tonemap.frag p0..p4)
+    float gamma;            // HDR_GAMMA (hdr_encode.comp, hdr_ui.frag)
+    float tm[4];            // the support buffer's vec4 (shaders/hdr_tonemap.frag p0)
 } Nits;
 static struct { unsigned seen; int cur; Nits snap[2]; PlatMutex lock; } N = {.seen = ~0u, .lock = PLAT_MUTEX_INIT};
 
@@ -121,32 +125,8 @@ static Nits nits(void) {
             n->peak = clampf((float)cfg_double("NX2NAVI_HDR_PEAK_NITS"), 80.0f, 10000.0f);
             n->game = clampf((float)cfg_double("NX2NAVI_HDR_GAME_NITS"), 48.0f, 500.0f);
             n->ui = clampf((float)cfg_double("NX2NAVI_HDR_UI_NITS"), 48.0f, 500.0f);
-            // the tone mapper as shaders/hdr_tonemap.frag numbers it: the game's curve, the luminance mapper, the
-            // observer-response mapper
-            const char *tm = cfg_value("NX2NAVI_HDR_TONEMAP");
-            float mapper = !strcmp(tm, "vanilla") ? 0.0f : !strcmp(tm, "renodrt") ? 3.0f : 9.0f;
-            // the gamma correction belongs to the luminance mapper: the other two give the picture as it is encoded
-            const char *g = cfg_value("NX2NAVI_HDR_GAMMA");
-            n->gamma = mapper != 3.0f ? 0.0f : !strcmp(g, "2.2") ? 1.0f : !strcmp(g, "2.4") ? 2.0f : 0.0f;
-            // the sliders' 0..100 with 50 unchanged become factors around 1; blowout, hue and hue clip are fractions
-            float pct[10];
-            static const char *const keys[10] = {"NX2NAVI_HDR_HIGHLIGHTS", "NX2NAVI_HDR_SHADOWS", "NX2NAVI_HDR_CONTRAST",
-                                                 "NX2NAVI_HDR_SATURATION", "NX2NAVI_HDR_HIGHLIGHT_SAT", "NX2NAVI_HDR_BLOWOUT",
-                                                 "NX2NAVI_HDR_FLARE", "NX2NAVI_HDR_HUE", "NX2NAVI_HDR_TONE_SLOPE",
-                                                 "NX2NAVI_HDR_HUE_CLIP"};
-            for (int i = 0; i < 10; i++) pct[i] = clampf((float)cfg_double(keys[i]), 0.0f, 100.0f);
-            float *t = n->tm;
-            t[0] = n->peak, t[1] = n->game, t[2] = n->ui;
-            t[3] = mapper;
-            t[4] = clampf((float)cfg_double("NX2NAVI_HDR_EXPOSURE"), 0.0f, 200.0f) / 100.0f;
-            t[5] = pct[0] * 0.02f, t[6] = pct[1] * 0.02f, t[7] = pct[2] * 0.02f;
-            t[8] = pct[3] * 0.02f, t[9] = pct[4] * 0.02f, t[10] = pct[5] * 0.01f, t[11] = pct[6] * 0.02f;
-            t[12] = pct[7] * 0.01f;
-            t[13] = clampf((float)cfg_double("NX2NAVI_HDR_GRADE"), 0.0f, 100.0f) / 100.0f;
-            t[14] = n->gamma, t[15] = pct[8] * 0.02f;
-            t[16] = pct[9] * 0.01f;
-            t[17] = !strcmp(cfg_value("NX2NAVI_HDR_MIDGRAY"), "render") ? 0.0f : 1.0f;
-            t[18] = cfg_bool("NX2NAVI_HDR_MATCH_SLOPE") ? 1.0f : 0.0f, t[19] = 0;
+            n->gamma = HDR_GAMMA;
+            n->tm[0] = n->peak, n->tm[1] = n->game, n->tm[2] = n->ui, n->tm[3] = 1.0f;
             __atomic_store_n(&N.cur, !N.cur, __ATOMIC_RELEASE);
             __atomic_store_n(&N.seen, v, __ATOMIC_RELEASE);
         }
@@ -155,7 +135,7 @@ static Nits nits(void) {
     return N.snap[__atomic_load_n(&N.cur, __ATOMIC_ACQUIRE)];
 }
 
-void vk_hdr_support(float out[20]) {
+void vk_hdr_support(float out[4]) {
     Nits n = nits();
     memcpy(out, n.tm, sizeof n.tm);
     if (!vk_hdr_active()) out[3] = -1.0f;   // no HDR10 swapchain (yet): the game's own SDR picture
@@ -440,7 +420,7 @@ static int spv_top_level(const uint32_t *w, uint64_t first_label, uint64_t end, 
 // translator's SupportBuffer ends there). The library's types are matched to the game's where the same (SPIR-V allows
 // one declaration of each), its constants and functions appended with new ids. Gives up (0) on any shape it does not
 // expect, and the shader stays as it was.
-enum { HDR_SETS = 5, HDR_PARAMS = HDR_SETS + 2 };   // nx_tonemap(vec3 x, vec4 scene, vec4 settings[HDR_SETS])
+enum { HDR_SETS = 1, HDR_PARAMS = HDR_SETS + 2 };   // nx_tonemap(vec3 x, vec4 scene, vec4 settings[HDR_SETS])
 static int tonemap_splice(uint32_t **spirv, uint64_t *words) {
     uint32_t *w = *spirv;
     uint64_t n = *words;
@@ -775,7 +755,8 @@ void vk_hdr_shader_swap(uint32_t **spirv, uint64_t *words) {
 int vk_hdr_track;                 // vk_exec_draw.c calls vk_hdr_draw: set at the first present with NX2NAVI_HDR=1
 static volatile int32_t g_active;   // the swapchain is HDR10 (gfx_present.c vk_hdr_set_active)
 static PlatMutex rec_lock = PLAT_MUTEX_INIT;
-static struct { VkImage win, src; VkFormat fmt; } recs[4];   // per presented window image: what the last draw copied
+// per presented window image: what the last draw copied, and where in the stream (vk_exec_stream_pos)
+static struct { VkImage win, src; VkFormat fmt; uint64_t pos; } recs[4];
 static int nrecs;
 
 void vk_hdr_set_active(int on) { plat_xchg32(&g_active, on); }
@@ -793,6 +774,8 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info) {
     for (int i = 0; i < 4; i++)   // unlocked first look: most draws go elsewhere (a stale slot only costs the lock below)
         known |= __atomic_load_n(&recs[i].win, __ATOMIC_RELAXED) == t->image;
     if (!known) return;
+    // the last such draw of the stream decides, as in the replay, also when replay workers record draws at once
+    uint64_t pos = vk_exec_stream_pos();
     VkImage src = VK_NULL_HANDLE;
     VkFormat fmt = VK_FORMAT_UNDEFINED;
     int ntex = 0, slot = -1;
@@ -809,7 +792,7 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info) {
     }
     plat_mutex_lock(&rec_lock);
     for (int i = 0; i < nrecs; i++)
-        if (recs[i].win == t->image) recs[i].src = src, recs[i].fmt = fmt;
+        if (recs[i].win == t->image && pos >= recs[i].pos) recs[i].src = src, recs[i].fmt = fmt, recs[i].pos = pos;
     plat_mutex_unlock(&rec_lock);
 }
 
@@ -820,7 +803,7 @@ void vk_hdr_present_source(const VkTexImage *win, VkImage *image, VkFormat *form
     int r = -1;
     for (int i = 0; i < nrecs; i++)
         if (recs[i].win == win->image) r = i;
-    if (r < 0 && nrecs < 4) r = nrecs++, recs[r].win = win->image, recs[r].src = VK_NULL_HANDLE;
+    if (r < 0 && nrecs < 4) r = nrecs++, recs[r].win = win->image, recs[r].src = VK_NULL_HANDLE, recs[r].pos = 0;
     // kept until the next draw into the window texture: a present again without a new copy shows the same picture
     if (r >= 0 && recs[r].src && vk_hdr_active()) *image = recs[r].src, *format = recs[r].fmt;
     plat_mutex_unlock(&rec_lock);
@@ -1176,14 +1159,15 @@ void vk_hdr_release(void) {
     memset(&H, 0, sizeof H);
 }
 
-// PQ code (0..1023) of a 10-bit channel to the sRGB byte of the same colour at the HUD's white (menu test shots and
-// flight thumbnails of an HDR10 swapchain).
+// Luminance of a PQ code (0..1023 over 1) in nits.
 static float pq_nits(float e) {
     const float m1 = 0.1593017578125f, m2 = 78.84375f, c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
     float p = powf(e, 1.0f / m2);
     return 10000.0f * powf(fmaxf(p - c1, 0.0f) / (c2 - c3 * p), 1.0f / m1);
 }
 
+// 10-bit PQ pixels of an HDR10 swapchain to bytes that show on a display of gamma 2.2 what the HDR display shows, the
+// HUD's white at 255 (menu test shots and flight thumbnails): a dark tone the HDR display lifts looks lifted here too.
 void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r) {
     float ui = nits().ui;
     // Rec. 2020 to Rec. 709 (the inverse of ITU-R BT.2087's matrix)
@@ -1196,9 +1180,43 @@ void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r) {
         for (int k = 0; k < 3; k++) c[k] = pq_nits(c[k] / 1023.0f) / ui;
         for (int k = 0; k < 3; k++) {
             float l = fminf(fmaxf(m[3 * k] * c[0] + m[3 * k + 1] * c[1] + m[3 * k + 2] * c[2], 0.0f), 1.0f);
-            float s = l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
-            out[4 * i + k] = (uint8_t)(s * 255.0f + 0.5f);
+            out[4 * i + k] = (uint8_t)(powf(l, 1.0f / 2.2f) * 255.0f + 0.5f);
         }
         out[4 * i + 3] = 255;
     }
+}
+
+// The luminance (Rec. 2020 Y, in nits) of the 10-bit PQ pixels inside the rectangle {x, y, w, h} of a stride-wide
+// image: out = the darkest pixel's, the 0.1st, 1st, 50th and 99th percentiles, the brightest's, and the share of pixels
+// under 0.01 nits. The percentiles come from a histogram of 64 bins a stop, from 2^-24 to 2^14 nits; a value is a bin's
+// upper edge.
+void vk_hdr_luminance_stats(const uint8_t *in, int stride, const int rect[4], int a2r, float out[7]) {
+    enum { LO = -24, HI = 14, PER = 64, BINS = (HI - LO) * PER };
+    static uint32_t hist[BINS + 1];
+    static float lut[1024];
+    for (int i = 0; i < 1024; i++) lut[i] = pq_nits((float)i / 1023.0f);
+    memset(hist, 0, sizeof hist);
+    float lo = 1e30f, hi = 0.0f;
+    uint64_t total = 0, dark = 0;
+    for (int y = rect[1]; y < rect[1] + rect[3]; y++)
+        for (int x = rect[0]; x < rect[0] + rect[2]; x++) {
+            uint32_t v;
+            memcpy(&v, in + 4 * ((size_t)y * (size_t)stride + (size_t)x), 4);
+            float r = lut[v & 1023], g = lut[v >> 10 & 1023], b = lut[v >> 20 & 1023];
+            if (a2r) { float t = r; r = b; b = t; }
+            float l = 0.2627002120f * r + 0.6779980715f * g + 0.0593017165f * b;
+            lo = fminf(lo, l), hi = fmaxf(hi, l);
+            dark += l < 0.01f;
+            int bin = l > 0.0f ? (int)floorf((log2f(l) - LO) * PER) + 1 : 0;   // bin 0: exactly black
+            hist[bin < 0 ? 0 : bin > BINS ? BINS : bin]++;
+            total++;
+        }
+    static const double q[4] = {0.001, 0.01, 0.5, 0.99};
+    for (int k = 0; k < 4; k++) {
+        uint64_t want = (uint64_t)(q[k] * (double)total), seen = 0;
+        int bin = 0;
+        while (bin < BINS && seen + hist[bin] <= want) seen += hist[bin++];
+        out[1 + k] = bin == 0 ? 0.0f : exp2f((float)LO + (float)bin / PER);
+    }
+    out[0] = total ? lo : 0.0f, out[5] = hi, out[6] = total ? (float)((double)dark / (double)total) : 0.0f;
 }

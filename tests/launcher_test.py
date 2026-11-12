@@ -2587,7 +2587,10 @@ class MakeGameTest(Tmp):
             self.assertEqual(build_shaders.stale(rt), [font])
         menu = (ROOT / 'runtime' / 'ui' / 'menu.cpp').read_text(encoding='utf-8')
         self.assertIn('#ifdef __has_embed\n#embed "fonts/Roboto-Medium.ttf"\n#else\n#include "roboto_ttf.h"\n#endif', menu)
-        self.assertEqual(build_shaders.EMBEDDED, {'ui/fonts/Roboto-Medium.ttf': 'ui/roboto_ttf.h'})
+        # the menu font, and the SMAA lookup textures of the anti-aliasing setting (runtime/vk_aa.c)
+        self.assertEqual(build_shaders.EMBEDDED, {'ui/fonts/Roboto-Medium.ttf': 'ui/roboto_ttf.h',
+                                                  'third_party/smaa/AreaTex.bin': 'smaa_area_tex.h',
+                                                  'third_party/smaa/SearchTex.bin': 'smaa_search_tex.h'})
 
     def test_objects_of_an_earlier_version_are_taken_over(self):
         """An entry under a key an earlier version gave the same compile is re-recorded under the new key when its

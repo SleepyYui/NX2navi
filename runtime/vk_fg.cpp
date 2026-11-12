@@ -241,7 +241,8 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
         ffxCreateContextDescFrameGeneration d = {};
         d.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
         d.header.pNext = &hl.header;
-        d.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE | (hdr_format(fmt) ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0);
+        // no infinite-depth flag: the game's far plane is finite, and each preparation gives it (vk_fg_frame)
+        d.flags = hdr_format(fmt) ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0;
         d.displaySize = {ext.width, ext.height};
         d.maxRenderSize = {max_render.width, max_render.height};
         d.backBufferFormat = ffxApiGetSurfaceFormatVK(fmt);
@@ -298,10 +299,13 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     double dt = last_ns ? (now - last_ns) / 1e6 : 16.67;
     last_ns = now;
     p.frameTimeDelta = dt > 0 && dt < 100 ? (float)dt : 16.67f;
-    p.cameraNear = 0.1f;   // Ocarina's projection: near 0.1, far at infinity (vk_ffx.cpp)
-    p.cameraFar = 1e8f;
-    p.cameraFovAngleVertical = 1.0f;
-    p.viewSpaceToMetersFactor = 0.01f;
+    // the frame's camera (vk_dlaa.c proj_planes), as the upscaler gets it (vk_ffx.cpp)
+    VkFfxCamera cam;
+    if (!vk_dlaa_ffx_camera(&cam)) memset(&cam, 0, sizeof cam);
+    p.cameraNear = cam.znear > 0 ? cam.znear : 0.1f;
+    p.cameraFar = cam.zfar > 0 ? cam.zfar : 1e8f;
+    p.cameraFovAngleVertical = cam.fov_y > 0 ? cam.fov_y : 1.0f;
+    p.viewSpaceToMetersFactor = cam.meters > 0 ? cam.meters : 1.0f;
     p.depth = image(&depth);
     p.motionVectors = image(&mv);
     r = vk_ffx_dispatch(&F.fg, &p.header);

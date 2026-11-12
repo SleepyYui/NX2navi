@@ -3,9 +3,10 @@
 // headers are in third_party/ffx_api (MIT); they are C++ in places, hence this file. Nothing of it runs unless the
 // upscaler or frame generation asks for FSR 3.1.
 //
-// FSR 3.1 takes the same inputs vk_dlaa.c makes for DLSS: the scene's light target (linear HDR), its D32F depth
-// (OpenGL-style, an infinite far plane, not inverted) and the camera motion vectors in render pixels from the current
-// frame to the previous one, the convention both share, so the vectors go in unscaled.
+// FSR 3.1 takes the same inputs vk_dlaa.c makes for DLSS: the scene's light target (linear HDR), its D32F depth (0
+// near, 1 far, with the near and far planes of the frame's own projection, vk_dlaa.c proj_planes) and the camera
+// motion vectors in render pixels from the current frame to the previous one, the convention both share, so the
+// vectors go in unscaled.
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -24,6 +25,7 @@
 extern "C" {
 #include "cfg.h"
 #include "host.h"
+#include "platform/platform.h"
 #include "vk.h"
 #include "vk_ffx.h"
 }
@@ -110,20 +112,35 @@ ffxReturnCode_t create_counted(ffxContext *ctx, ffxCreateContextDescHeader *desc
     return r;
 }
 
-// One upscaling context per render and output size: each render scale the menu sets brings its own, and so do the
-// game's second scenes. When all are taken, the least recently used one is destroyed for the new size once the GPU is
-// idle, as vk_dlaa.c free_size does for DLSS. Without that, a seventh size found no context, and vk_dlaa.c turned
-// FSR 3.1 off for the rest of the run: stepping through the render scales in the menu was enough.
+// One upscaling context per output size, made for render sizes up to the output's: every render scale the menu sets
+// runs on it with its own render size at each dispatch (the API's dynamic resolution, up to maxRenderSize), and the
+// game's second scenes, of another output size, get their own. When all are taken, the least recently used one is
+// destroyed for the new size once the GPU is idle, as vk_dlaa.c free_size does for DLSS. One per render size, as
+// before, kept a context for each mode tried, each with its own video memory, and the seventh size found none.
 struct Up {
     ffxContext ctx = nullptr;
-    uint32_t w = 0, h = 0, ow = 0, oh = 0;
-    uint64_t used = 0;   // up_tick when context_for last returned it
-} U[6];
+    uint32_t mw = 0, mh = 0, ow = 0, oh = 0;   // the largest render size it takes; the output size
+    uint64_t used = 0, used_ns = 0;            // up_tick and the time when context_for last returned it
+} U[4];
 uint64_t up_tick;
 // A context used in the last few calls may sit in a command buffer that is not submitted yet, where waiting for the
 // GPU does not cover it: a frame makes one or two calls (the scene, and a second scene after it), so this is a few
 // frames back.
 const uint64_t UP_RECENT = 8;
+// A context no upscale used for this long goes (trim): FSR 3.1's after a switch to FSR 4, and a second scene's (the
+// pause screen's) a while after it closed. Unused that long, no command buffer names it.
+const uint64_t UP_IDLE_NS = 90ull * 1000000000ull;
+
+void destroy_up(Up *u, const char *why) {
+    rt_log("ffx: the FSR 3.1 context for %ux%u (render sizes up to %ux%u) destroyed: %s", u->ow, u->oh, u->mw, u->mh, why);
+    A.destroy(&u->ctx, nullptr);
+    *u = Up();
+}
+
+void trim(uint64_t now_ns) {
+    for (Up &u : U)
+        if (u.ctx && now_ns - u.used_ns > UP_IDLE_NS) destroy_up(&u, "no upscale used it for 90 s");
+}
 
 FfxApiResource image(const VkFfxImage *i, uint32_t state, uint32_t usage) {
     VkImageCreateInfo ci = {};
@@ -139,31 +156,34 @@ FfxApiResource image(const VkFfxImage *i, uint32_t state, uint32_t usage) {
 
 Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     up_tick++;
+    uint64_t now = plat_now_ns();
+    Up *small = nullptr;   // a context of this output size made for smaller render sizes
     for (Up &u : U)
-        if (u.ctx && u.w == w && u.h == h && u.ow == ow && u.oh == oh) {
-            u.used = up_tick;
-            return &u;
+        if (u.ctx && u.ow == ow && u.oh == oh) {
+            if (w <= u.mw && h <= u.mh) {
+                u.used = up_tick, u.used_ns = now;
+                return &u;
+            }
+            small = &u;
         }
     Up *slot = nullptr, *lru = nullptr;
     for (Up &u : U) {
         if (!u.ctx) {
-            slot = &u;
-            break;
+            if (!slot) slot = &u;
+            continue;
         }
         if (up_tick - u.used >= UP_RECENT && (!lru || u.used < lru->used)) lru = &u;
     }
+    if (small && up_tick - small->used >= UP_RECENT) slot = nullptr, lru = small;   // a larger one takes its place
     const VkCtx *c = vk_ctx();
     if (!slot && lru) {
-        static int told;
-        if (told++ < 20)
-            rt_log("ffx: FSR 3.1 context %ux%u -> %ux%u destroyed for %ux%u -> %ux%u (all %d in use)", lru->w, lru->h, lru->ow,
-                   lru->oh, w, h, ow, oh, (int)(sizeof U / sizeof U[0]));
         vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // its work may still be in flight
-        A.destroy(&lru->ctx, nullptr);
-        *lru = Up();
+        destroy_up(lru, lru == small ? "a larger render size came" : "its slot went to another output size");
         slot = lru;
     }
     if (!slot) return nullptr;
+    // the render size up to the output size: every mode of the menu, and a scene drawn at the output size itself
+    uint32_t mw = w > ow ? w : ow, mh = h > oh ? h : oh;
     ffxCreateBackendVKDesc be = {};
     be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     be.vkDevice = c->device;
@@ -172,21 +192,23 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     ffxCreateContextDescUpscale d = {};
     d.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     d.header.pNext = &be.header;
-    d.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_DEPTH_INFINITE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
-    d.maxRenderSize = {w, h};
+    // no infinite-depth flag: the game's far plane is finite (vk_dlaa.c proj_planes) and each dispatch gives it
+    d.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    d.maxRenderSize = {mw, mh};
     d.maxUpscaleSize = {ow, oh};
     d.fpMessage = message;
     ffxReturnCode_t r = create_counted(&slot->ctx, &d.header);
     if (r != FFX_API_RETURN_OK) {
-        rt_log("ffx: FSR 3.1 context creation at %ux%u -> %ux%u failed (%u)", w, h, ow, oh, (unsigned)r);
+        rt_log("ffx: FSR 3.1 context creation for %ux%u (render sizes up to %ux%u) failed (%u)", ow, oh, mw, mh, (unsigned)r);
         slot->ctx = nullptr;
         return nullptr;
     }
-    slot->w = w, slot->h = h, slot->ow = ow, slot->oh = oh, slot->used = up_tick;
+    slot->mw = mw, slot->mh = mh, slot->ow = ow, slot->oh = oh, slot->used = up_tick, slot->used_ns = now;
     ffxQueryGetProviderVersion v = {};
     v.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     A.query(&slot->ctx, &v.header);
-    rt_log("ffx: FSR 3.1 upscaling at %ux%u -> %ux%u (%s)", w, h, ow, oh, v.versionName ? v.versionName : "provider unknown");
+    rt_log("ffx: FSR 3.1 upscaling to %ux%u from render sizes up to %ux%u (%s)", ow, oh, mw, mh,
+           v.versionName ? v.versionName : "provider unknown");
     return slot;
 }
 
@@ -240,17 +262,27 @@ extern "C" int vk_ffx_available(void) {
 
 extern "C" int vk_ffx_framegen_available(void) { return vk_ffx_available(); }   // the same library, its API calls
 
-// NX2NAVI_FSR4 (default 0, live): FSR 4 where it runs (vk_ffx4.cpp), else FSR 3.1.
-extern "C" int vk_ffx_fsr4(void) { return cfg_bool("NX2NAVI_FSR4") && vk_ffx4_available(); }
+// NX2NAVI_FSR4 (default 0, live): FSR 4 where it runs (vk_ffx4.cpp) and has not failed in a row, else FSR 3.1.
+extern "C" int vk_ffx_fsr4(void) { return cfg_bool("NX2NAVI_FSR4") && vk_ffx4_available() && !vk_ffx4_failed(); }
+
+extern "C" int vk_ffx_trim_idle(uint64_t recent) {
+    int n = 0;
+    for (Up &u : U)
+        if (u.ctx && up_tick - u.used >= recent) destroy_up(&u, "room for an FSR 4 context"), n++;
+    return n;
+}
 
 extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
-                              const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, float fov_y) {
+                              const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, const VkFfxCamera *cam) {
     if (!vk_ffx_load()) return 0;
+    uint64_t now = plat_now_ns();
+    trim(now);
+    vk_ffx4_trim(now);
     // Each upscaler keeps a history of its own: the frame after a change from one to the other starts it anew, or it
     // would blend this picture with whatever that upscaler last saw.
     static int last;   // 3 or 4: which one made the frame before
     if (vk_ffx_fsr4()) {
-        if (vk_ffx4_upscale(cb, color, depth, mv, out, jx, jy, reset || last != 4, dt_ms, fov_y)) {
+        if (vk_ffx4_upscale(cb, color, depth, mv, out, jx, jy, reset || last != 4, dt_ms, cam)) {
             if (last != 4) rt_log("ffx: the upscaler is %s", vk_ffx4_name());
             last = 4;
             return 1;
@@ -282,10 +314,11 @@ extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const
     d.frameTimeDelta = dt_ms;
     d.preExposure = 1.0f;
     d.reset = reset != 0;
-    d.cameraNear = 0.1f;   // Ocarina's projection (vk_dlaa.c ocam_vp): near 0.1, far at infinity
-    d.cameraFar = 1e8f;
-    d.cameraFovAngleVertical = fov_y > 0 ? fov_y : 1.0f;
-    d.viewSpaceToMetersFactor = 0.01f;   // the game's units are centimetres
+    // the frame's camera (vk_dlaa.c proj_planes)
+    d.cameraNear = cam && cam->znear > 0 ? cam->znear : 0.1f;
+    d.cameraFar = cam && cam->zfar > 0 ? cam->zfar : 1e8f;
+    d.cameraFovAngleVertical = cam && cam->fov_y > 0 ? cam->fov_y : 1.0f;
+    d.viewSpaceToMetersFactor = cam && cam->meters > 0 ? cam->meters : 1.0f;
     ffxReturnCode_t r = A.dispatch(&u->ctx, &d.header);
     if (r != FFX_API_RETURN_OK) {
         static int told;

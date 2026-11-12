@@ -121,7 +121,14 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
    not just their base location: an FS `vec4[16]` requires all 16 locations even when it only accesses some elements.
    The same reflected mask feeds recorded-pipeline prewarm, independent stage-library unions and direct pipeline builds.
    Our translator never links stages, so its `InitializeVertexOutputs` would initialise no user output;
-   translator patch 0006 initialises the unlinked outputs. **Implemented; array-span runtime validation pending.**
+   translator patch 0006 initialises the unlinked outputs. Mesh programs: a component of a position or generic vector
+   that the program's output map leaves out is written as (0, 0, 0, 1) by the mesh entry function
+   (`tools/xlate/MeshSpirv.cs`) and by the fallback's vertex stage (`runtime/mesh_fb.c` `meshfb_vs`); a whole location
+   the fragment stage reads and the mesh program does not write is filled in the fragment module of the mesh pipeline
+   (`vk_pipeline.c` `spirv_fs_fill_inputs`): (0, 0, 0, 1), or for a mesh program that draws points the point sprite's
+   coordinate (s, t, 0, 1): the fragment shaders recorded with two of the game's point-drawing mesh programs read
+   location 5, which those programs never write.
+   **Implemented; array-span runtime validation pending.**
 3. **Masked clears.** `vk_exec.c` skips colour clears with a partial channel mask (`W_CLEAR_MASK`); `clear_ds` skips stencil
    clears with a partial mask (`W_STENCIL_MASK`). NX2navi issues such clears. Check the log for
    `colour clear with channel mask` and `stencil clear with mask`. The hardware recipe (1.3) shows what the replay must do: colour clear = scissor 0 + channel mask, stencil clear = `value & mask` merged under the front write mask; so a draw with `colorWriteMask` / `stencilWriteMask` set to the clear mask is the exact equivalent. **Missing.**

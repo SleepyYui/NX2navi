@@ -100,7 +100,11 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   (`vk_exec_draw.c pool_sync`); slots that resolve alike share one lookup.
   Finalization is retained on registered slots independently of image-cache eviction: a stale CPU-backed descriptor
   cannot recreate an image from freed storage or follow newly reused CPU bytes. Registration makes it current again;
-  finalized descriptors may still follow live GPU-owned content.
+  finalized descriptors may still follow live GPU-owned content, and sample their own image while it still holds
+  the texture (`vk_texture.c stale_kept`): the game finalizes ahead of the replay of its earlier frames. A finalize
+  marks only the slots its own texture object registered (by initialization serial): the game initializes and
+  registers the next terrain heightmap at the storage of the previous one before it finalizes that one
+  (`vk_texture.c vk_texture_release`).
 - Shaders: Ampere (SM86) code is lowered to Maxwell (`tools/xlate/AmpereLowering.cs`) and translated to SPIR-V by the
   pinned shader translator (`tools/vendor/ryujinx`, 1.3.2) with our patches (`tools/xlate/patches/`), built with .NET 10 NativeAOT as
   `nx2navi_xlate.exe` and run as separate processes. Translations are cached on disk; shaders and pipelines seen in
@@ -151,8 +155,10 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
     a village frame's 45 mesh draws are 45 passes cut, 90 to 135 dispatches and about 270 barriers more than with mesh
     shaders. The buffers (`mesh_fallback_mb`, 128 MiB) are reused by every draw, so they hold the largest draw, not
     a frame; a draw that emits more loses what does not fit, and the log says how much it needed.
-  - A program's modules and compute pipelines are made on a thread of their own at its first draw, which is skipped
-    until they are ready; they are not recorded for the next start, where the pipeline cache makes them quick.
+  - A program's modules and compute pipelines are made by worker threads at its first draw, which is skipped until
+    they are ready (`mesh_fallback_workers`, auto: one for each 4 logical processors, 1 to 4, so a place's programs,
+    which all arrive in its first frames, are not made one after the other); they are not recorded for the next start,
+    where the pipeline cache makes them quick.
     Not carried: the far shadow cascades' coarser shading rate, a draw's first workgroup other than 0, and more
     workgroups in one draw than one compute dispatch may have.
 - Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it: stage libraries compiled ahead, a fast link
@@ -185,12 +191,20 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   cache", `cache_save`).
 - The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `vk_fsr.c` runs AMD FSR 1
   (EASU, RCAS) on the present when the window is larger than the picture.
+- Anti-aliasing (`vk_aa.c`, `NX2NAVI_AA`): the game anti-aliases with its own SMAA, three compute passes after the bloom
+  composite (edges, blending weights, composition into the scene target as square-rooted RGB9E5 words). `off`, `fxaa`
+  and `smaa` leave out the first two and replace the composition with `shaders/aa_post.comp` or SMAA at its Ultra preset
+  (`shaders/smaa_*.comp`); the game's passes are known by a hash of their guest code (`vk_exec_draw.c` `aa_dispatch`).
+  `taa` is DLSS or FSR 3.1 at the scene's size; while either runs, the game's SMAA stays.
 - HDR (`vk_hdr.c`): the game tonemaps its scene into a float target, upscales it, draws the HUD into a second float
   target and copies that into the 8-bit sRGB window texture it presents. With `NX2NAVI_HDR=1` the tonemap shader gets
   the function of `shaders/hdr_tonemap.frag` spliced in where its SDR curve clamps each channel, so the float picture
   holds the HDR picture relative to the HUD's white (the function gets the values the curve takes, and the scene
-  before the game's exposure gain with that gain, which its default tone mapper anchors mid grey on); the game's FSR 1 pass loses its output clamp; the present reads
-  the float picture in place of the window texture and `shaders/hdr_encode.comp` writes PQ for an HDR10 swapchain.
+  before the game's exposure gain with that gain, which it anchors mid grey on); the game's FSR 1 pass loses its output
+  clamp; the present reads the float picture in place of the window texture and `shaders/hdr_encode.comp` writes PQ
+  for an HDR10 swapchain, showing the picture as a display of gamma 2.2 would (the game is graded for one: decoded as
+  its sRGB encode, the darkest tones would sit far above black). The look is fixed; the settings are the peak, game and
+  HUD whites.
   `NX2NAVI_HDR=native` reports an HDR10 display to the game, which then renders and presents its own PQ picture.
   The menu switches between off and `1` during a run: the splice, the HDR extensions and the settings in the support
   buffer are there from the start whatever is set (`vk_hdr_armed`), the spliced tonemap returns the game's SDR result

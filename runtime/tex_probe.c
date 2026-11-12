@@ -961,7 +961,16 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     const VkTexImage *renewed = vk_texture_by_id(5, NULL, NULL);
     GCHECK(renewed && renewed->format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK && renewed->width == 64 && renewed->height == 48,
            "re-registered CPU slot 5 did not resolve its own descriptor");
+    // A release finalizes only the slots of its own texture object: another texture initialized at the same storage
+    // with the same parameters before the finalize keeps its slot (vk_texture_release, terrain heightmaps).
+    tex_t bn = b;
+    bn.serial = 6;
+    vk_texture_register(6, &bn, NULL);
     vk_texture_release(&b);
+    const VkTexImage *kept = vk_texture_by_id(6, NULL, NULL);
+    GCHECK(kept && kept->width == 64 && kept->height == 48 && !vk_texture_by_id(5, NULL, NULL),
+           "a release finalized slot 6 of another live texture, or left its own slot 5 current");
+    vk_texture_release(&bn);
     // Once the live texture at its storage holds GPU content the storage bytes lack, the finalized CPU slot follows it.
     // The live texture is cleared on the GPU and noted as rendered into, as a draw into it would be; the slot's image
     // must then show the clear, which neither the storage bytes nor a recreated image of the slot's own descriptor hold.

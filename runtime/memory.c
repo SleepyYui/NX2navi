@@ -75,9 +75,39 @@ static int reserve_at(uint64_t at, uint64_t size, int watch) { return plat_mem_r
 #define FRZ_HOLD_MS 5000u
 static volatile uint8_t frz[RT_ADDRESS_LIMIT >> FRZ_SHIFT];
 static uint32_t thaw_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: GetTickCount of the last thaw request, 0 never
+// Hot regions. A region a write thaws soon after its freeze is one the game keeps writing (the buffers its loaders
+// stream an area into): frozen again as soon as it was idle a moment, it was thawed again moments later. Running
+// through Hyrule Field froze and thawed about 8,000 regions in 6,000 frames, and while the loaders wrote and the
+// driver locked new memory each thaw's VirtualQuery took 15 to 20 ms: a loader thread stalled 78 to 111 ms in thaws in
+// each of the hitches of 125 to 140 ms of that walk, with the game's main thread waiting for it. So a write that thaws a
+// region within FRZ_QUICK_MS of its freeze holds the region thawed for its hot time, FRZ_HOT_MIN_MS at first and
+// doubled at each such thaw up to FRZ_HOT_MAX_MS; a region that stayed frozen longer starts again from nothing. A
+// freeze only saves later write-watch queries over the region, which a region written that often needs anyway.
+#define FRZ_QUICK_MS 60000u
+#define FRZ_HOT_MIN_MS 4000u
+#define FRZ_HOT_MAX_MS 600000u
+static uint32_t frz_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];        // frz_lock: GetTickCount | 1 of its last freeze, 0 never
+static uint32_t frz_hot_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];    // frz_lock: its hot time now, 0 not hot
+static uint32_t frz_hot_until[RT_ADDRESS_LIMIT >> FRZ_SHIFT]; // frz_lock: no freeze before this GetTickCount, 0 none
+static volatile int64_t frz_hot_holds;                        // quick thaws that held a region, since the last stats
 static volatile int32_t nfrz;
 static PlatMutex frz_lock = PLAT_MUTEX_INIT;
 static volatile int64_t frz_count[4];   // freezes; thaws by a write fault, by mem_thaw, by a mapping change
+// Thaws outside frz_lock (NX2NAVI_FREEZE_ASYNC, default 1; 0: every thaw under the lock, as before). While the game
+// streams an area it creates and finalizes up to 1,500 memory pools a second, the driver pins and unpins the imported
+// ones, and the VirtualQuery and VirtualProtect calls of a thaw then take 10-20 ms each. Under frz_lock that held the
+// replay (mem_lazy_skip, the freeze pass) and every other thread that faulted or thawed, a 25-45 ms frame. So a thaw by
+// a write fault or by mem_thaw marks its regions FRZ_THAWING under the lock, makes their pages read-write without it and
+// ends them under it again. A region being thawed is no longer frozen for anyone who asks (a freeze, an arm, a probe
+// leave it alone); a fault in it waits for the thaw to end and runs again; a mapping change waits for it first
+// (thaw_wait_locked), so a late VirtualProtect never undoes the change; mem_thaw makes its pages read-write itself.
+// freeze_locked keeps the runs it made read-only (frz_runs), so a thaw needs no VirtualQuery.
+#define FRZ_THAWING 2
+static int frz_async = 1;               // the setting, read in mem_init
+typedef struct { uint8_t n; uint16_t run[16][2]; } FrzRuns;   // pages of the region, [first, end)
+static FrzRuns *frz_runs[RT_ADDRESS_LIMIT >> FRZ_SHIFT];      // frz_lock (written at a freeze): NULL or n 0 = not kept
+static volatile int64_t frz_async_n;    // thaws done outside the lock, since the start
+static volatile int64_t frz_protect_fails;   // VirtualProtect failures of those thaws, since the start
 
 // Probed regions (NX2NAVI_WB_PROBE=1, a diagnosis). The back end copies what the GPU wrote into a mirrored pool back
 // into guest memory after every submission, in case the CPU or a host path reads it; whether anything does is what
@@ -103,7 +133,7 @@ static int watched(uint64_t addr, uint64_t size) {
 // frz_lock held exclusively: the pages of a probed region get back what they had, read-only in a frozen region.
 static void unprobe_locked(uint64_t r) {
     if (!prb[r]) return;
-    int prot = frz[r] ? PLAT_PROT_READ : PLAT_PROT_RW;
+    int prot = frz[r] == 1 ? PLAT_PROT_READ : PLAT_PROT_RW;
     uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, b;
     for (; a < end; a = b)   // every inaccessible run is the probe's: mem_probe took only regions without one
         if (plat_mem_state(a, end, &b) == PLAT_PROT_NONE && !plat_mem_protect(a, b - a, prot))
@@ -185,6 +215,7 @@ static uint8_t lz_touch_n[RT_ADDRESS_LIMIT >> FRZ_SHIFT];     // frz_lock: piece
 static uint32_t lz_heavy_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: ... of its last touch taken as a reader's
 static int lz_chunk;                    // the setting, read in mem_init
 static uint64_t lz_pieces, lz_piece_bytes, lz_heavy;   // frz_lock, since the last report
+static uint64_t lz_foreign;             // frz_lock, since the start: segments of another buffer mem_lazy_skip gave back
 // frz_lock: the first faults on armed pages since the last report, for its lines (trace perf)
 #define LZ_NOTES 8
 static struct { uint64_t addr, lo, hi, out; uint32_t tid; uint8_t write, stale, hold; } lz_note[LZ_NOTES];
@@ -414,13 +445,23 @@ uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t
 }
 
 // The armed parts of [a, a + n), sorted, into out (at most max); they count as stale from here on: the caller leaves
-// the bytes it is about to write there in the mirror. Returns how many.
-int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t out[][2], int max) {
+// the bytes it is about to write there in the mirror h0, at buffer offset address + delta. Returns how many.
+// A segment there that was armed for another buffer (a mirror evicted since, whose range a write-back armed while the
+// eviction ran) is given back instead, without a fetch: its buffer may be gone, and since its mirror went every GPU
+// write went to guest memory, so guest memory holds the bytes. Marked stale, it would have its next touch copy from the
+// freed buffer, a GPU read fault that loses the device.
+int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t h0, int64_t delta, uint64_t out[][2], int max) {
     if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED) || !n || a >= RT_ADDRESS_LIMIT || a + n > RT_ADDRESS_LIMIT) return 0;
     int any = 0, k = 0;
     for (uint64_t r = a >> FRZ_SHIFT; r <= (a + n - 1) >> FRZ_SHIFT && !any; r++) any = lzr[r];
     if (!any) return 0;
     plat_mutex_lock(&frz_lock);
+    for (int i = lz_n; i-- > 0;)
+        if (lzs[i].lo < a + n && lzs[i].hi > a && (lzs[i].h0 != h0 || lzs[i].delta != delta)) {
+            lzs[i].stale = 0;
+            lz_foreign++;
+            lazy_drop_locked(i, 4);
+        }
     for (int i = 0; i < lz_n && k < max; i++) {
         uint64_t lo = lzs[i].lo > a ? lzs[i].lo : a, hi = lzs[i].hi < a + n ? lzs[i].hi : a + n;
         if (lo >= hi) continue;
@@ -440,6 +481,34 @@ int mem_lazy_armed(uint64_t a, uint64_t n) {
     int ok = lazy_covered_locked(a, a + n);
     plat_mutex_unlock(&frz_lock);
     return ok;
+}
+
+// Copies each of n ranges of guest memory, src[i] = {address, bytes}, to dst[i] when every page of it can be read
+// without a fault; ok[i] says which were. An armed range, a probed region or a page the game made inaccessible is left
+// out instead of faulting on the caller's thread (vk_memory.c mirror_capture runs inside a submission, where a fetch
+// could not be sent). frz_lock is held over all of them, so nothing is armed or probed meanwhile; a range in regions
+// with neither (lzr, prb: both change under that lock, with the pages' protection) is copied without asking the system
+// for its pages' state. Returns how many were copied.
+int mem_copy_readable(uint8_t *const *dst, const uint64_t (*src)[2], int n, uint8_t *ok) {
+    int got = 0;
+    plat_mutex_lock(&frz_lock);
+    for (int i = 0; i < n; i++) {
+        uint64_t a = src[i][0], len = src[i][1];
+        ok[i] = 0;
+        if (!len || a >= RT_ADDRESS_LIMIT || a + len > RT_ADDRESS_LIMIT) continue;
+        int quick = 1, can = 1;
+        for (uint64_t r = a >> FRZ_SHIFT; quick && r <= (a + len - 1) >> FRZ_SHIFT; r++)
+            quick = !__atomic_load_n(&lzr[r], __ATOMIC_RELAXED) && !__atomic_load_n(&prb[r], __ATOMIC_RELAXED);
+        for (uint64_t x = a, e; !quick && can && x < a + len; x = e) {
+            int st = plat_mem_state(x, a + len, &e);
+            can = (st == PLAT_PROT_RW || st == PLAT_PROT_READ) && e > x;
+        }
+        if (!can) continue;
+        memcpy(dst[i], (const void *)(uintptr_t)a, len);
+        ok[i] = 1, got++;
+    }
+    plat_mutex_unlock(&frz_lock);
+    return got;
 }
 
 // Releases what is armed in [a, a + n): before the buffers a fetch would read go away.
@@ -552,6 +621,13 @@ void mem_lazy_note(char *out, size_t n) {
 
 // One log line since the last one; skipped: the bytes the back end left in the mirror since then.
 void mem_lazy_report(uint64_t frame, uint64_t skipped) {
+    static int64_t async_said = -1;
+    int64_t an = __atomic_load_n(&frz_async_n, __ATOMIC_RELAXED), af = __atomic_load_n(&frz_protect_fails, __ATOMIC_RELAXED);
+    if ((rt_trace & RT_TRACE_PERF) && an != async_said) {
+        async_said = an;
+        rt_log("mem: thaws outside the freeze lock so far %lld (NX2NAVI_FREEZE_ASYNC), page protections that failed there "
+               "%lld", (long long)an, (long long)af);
+    }
     if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED)) return;
     plat_mutex_lock(&frz_lock);
     uint64_t bytes = 0, fr = lz_faults[0], fw = lz_faults[1], other = lz_other, nf = lz_fetches, fb = lz_fetch_bytes,
@@ -567,9 +643,15 @@ void mem_lazy_report(uint64_t frame, uint64_t skipped) {
     memcpy(no, lz_no, sizeof no);
     memset(lz_no, 0, sizeof lz_no);
     lz_no_small = lz_arm_calls = 0;
-    uint64_t pieces = lz_pieces, piece_bytes = lz_piece_bytes, heavy = lz_heavy;
+    uint64_t pieces = lz_pieces, piece_bytes = lz_piece_bytes, heavy = lz_heavy, foreign = lz_foreign;
     lz_pieces = lz_piece_bytes = lz_heavy = 0;
     plat_mutex_unlock(&frz_lock);
+    static uint64_t foreign_said;
+    if (foreign != foreign_said) {
+        foreign_said = foreign;
+        rt_log("mem: lazy write-back: %llu armed ranges named a mirror that is no longer the pool's, given back without "
+               "a fetch so far", (unsigned long long)foreign);
+    }
     rt_log("mem: lazy write-back at frame %llu: %d ranges armed, %.1f MiB; since the last line %.1f MiB left in the "
            "mirror, %llu read and %llu write faults (%llu inside a part's window), %llu other releases, %llu fetches of "
            "%.1f MiB in %.2f ms, %llu arms refused (a CPU write not in the mirror yet)", (unsigned long long)frame, n,
@@ -596,22 +678,70 @@ void mem_lazy_report(uint64_t frame, uint64_t skipped) {
                (unsigned long long)calls, (unsigned long long)small);
 }
 
-// frz_lock held exclusively. why: 1 a write fault, 2 mem_thaw (holds the region thawed), 3 a mapping change here.
-static void thaw_locked(uint64_t r, int why) {
+// Makes the pages region r's freeze made read-only read-write again: the runs freeze_locked kept, else every read-only
+// run (freeze_locked left reserved holes, heap pages given back, as they were; every committed page of a frozen region
+// was read-write at the freeze, and mapping changes thaw or wait before they run, so these are all ours). strict: under
+// frz_lock, a failure ends the process; outside it (a thaw in flight, FRZ_THAWING) the pages are what the freeze left,
+// and a failure is only counted.
+static void thaw_pages(uint64_t r, int strict) {
+    uint64_t base = r << FRZ_SHIFT;
+    const FrzRuns *k = frz_runs[r];
+    if (k && k->n) {
+        for (int i = 0; i < k->n; i++) {
+            uint64_t a = base + ((uint64_t)k->run[i][0] << 12), n = (uint64_t)(k->run[i][1] - k->run[i][0]) << 12;
+            if (!plat_mem_protect(a, n, PLAT_PROT_RW)) {
+                if (strict)
+                    rt_fatal("memory: thawing %#llx+%#llx failed", (unsigned long long)a, (unsigned long long)n);
+                plat_inc64(&frz_protect_fails);
+            }
+        }
+        return;
+    }
+    uint64_t a = base, end = a + FRZ_SIZE, b;
+    for (; a < end; a = b)
+        if (plat_mem_state(a, end, &b) == PLAT_PROT_READ && !plat_mem_protect(a, b - a, PLAT_PROT_RW)) {
+            if (strict) rt_fatal("memory: thawing %#llx+%#llx failed", (unsigned long long)a, (unsigned long long)(b - a));
+            plat_inc64(&frz_protect_fails);
+        }
+}
+
+// frz_lock held exclusively: what a thaw does before the pages (the hold, the lazy write-back's ranges, a probe).
+// Returns 1 when the region is frozen.
+static int thaw_begin_locked(uint64_t r, int why) {
     if (why == 2) thaw_ms[r] = (uint32_t)plat_now_ms() | 1;
     if (lzr[r]) lazy_drop_region_locked(r, why + 1);   // not a fault on an armed page: no hold
     if (prb[r]) unprobe_locked(r);
-    if (!frz[r]) return;
-    // The read-only runs only: freeze_locked left reserved holes (heap pages given back) as they were. Every committed
-    // page of a frozen region was read-write at the freeze, and mapping changes thaw before they run, so these are all
-    // ours.
-    uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, b;
-    for (; a < end; a = b)
-        if (plat_mem_state(a, end, &b) == PLAT_PROT_READ && !plat_mem_protect(a, b - a, PLAT_PROT_RW))
-            rt_fatal("memory: thawing %#llx+%#llx failed", (unsigned long long)a, (unsigned long long)(b - a));
+    return frz[r] == 1;
+}
+
+static void thaw_end_locked(uint64_t r, int why);
+
+// frz_lock held exclusively. why: 1 a write fault, 2 mem_thaw (holds the region thawed), 3 a mapping change here.
+// A region another thread is thawing (FRZ_THAWING) gets its pages made read-write here too, and is ended here.
+static void thaw_locked(uint64_t r, int why) {
+    if (!thaw_begin_locked(r, why) && frz[r] != FRZ_THAWING) return;
+    thaw_pages(r, 1);
+    __atomic_store_n(&frz[r], FRZ_THAWING, __ATOMIC_RELEASE);
+    thaw_end_locked(r, why);
+}
+
+// frz_lock held exclusively: the end of a thaw. Nothing when another thread ended it meanwhile.
+static void thaw_end_locked(uint64_t r, int why) {
+    if (frz[r] != FRZ_THAWING) return;
     __atomic_store_n(&frz[r], 0, __ATOMIC_RELEASE);
     plat_dec32(&nfrz);
     plat_inc64(&frz_count[why]);
+    if (why == 1) {   // a write: a quick one makes the region hot, a late one ends its hot time
+        uint32_t now = (uint32_t)plat_now_ms();
+        if (frz_ms[r] && now - frz_ms[r] < FRZ_QUICK_MS) {
+            uint32_t h = frz_hot_ms[r] ? frz_hot_ms[r] * 2 : FRZ_HOT_MIN_MS;
+            frz_hot_ms[r] = h > FRZ_HOT_MAX_MS ? FRZ_HOT_MAX_MS : h;
+            frz_hot_until[r] = (now + frz_hot_ms[r]) | 1;
+            plat_inc64(&frz_hot_holds);
+        } else {
+            frz_hot_ms[r] = 0;
+        }
+    }
 }
 
 // frz_lock held exclusively.
@@ -619,6 +749,20 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
     if (!n || a >= RT_ADDRESS_LIMIT) return;
     uint64_t r0 = a >> FRZ_SHIFT, r1 = (a + n - 1 < RT_ADDRESS_LIMIT ? a + n - 1 : RT_ADDRESS_LIMIT - 1) >> FRZ_SHIFT;
     for (uint64_t r = r0; r <= r1; r++) thaw_locked(r, why);
+}
+
+// frz_lock held exclusively: returns once no region of [a, a + n) is being thawed outside the lock (FRZ_THAWING),
+// releasing the lock while it waits. A mapping change runs after this: the thaw's VirtualProtect then cannot land on
+// the pages after the change and undo it.
+static void thaw_wait_locked(uint64_t a, uint64_t n) {
+    if (!n || a >= RT_ADDRESS_LIMIT) return;
+    uint64_t r0 = a >> FRZ_SHIFT, r1 = (a + n - 1 < RT_ADDRESS_LIMIT ? a + n - 1 : RT_ADDRESS_LIMIT - 1) >> FRZ_SHIFT;
+    for (uint64_t r = r0; r <= r1; r++)
+        while (__atomic_load_n(&frz[r], __ATOMIC_ACQUIRE) == FRZ_THAWING) {
+            plat_mutex_unlock(&frz_lock);
+            plat_wait_ns(20000);
+            plat_mutex_lock(&frz_lock);
+        }
 }
 
 // Lazy heap (NX2NAVI_HEAP_LAZY, Windows only; off by default). Windows charges every committed page to the system's
@@ -695,8 +839,39 @@ static int heap_lazy_fault(uint64_t a) {
 
 void mem_thaw(uint64_t a, uint64_t n) {
     plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
-    if (heap_lazy) heap_lazy_commit_locked(a, n);   // the kernel's write would fail on a reserved page as well
-    thaw_range_locked(a, n, 2);
+    if (heap_lazy || !frz_async || !n || a >= RT_ADDRESS_LIMIT) {
+        if (heap_lazy) {
+            thaw_wait_locked(a, n);   // it commits pages: a mapping change
+            heap_lazy_commit_locked(a, n);   // the kernel's write would fail on a reserved page as well
+        }
+        thaw_range_locked(a, n, 2);
+        plat_mutex_unlock(&frz_lock);
+        return;
+    }
+    // The regions frozen now are marked FRZ_THAWING and made read-write without the lock (see FRZ_THAWING), up to
+    // MANY at a time; those another thread is thawing are made read-write here too, as the caller's kernel access needs
+    // every page of them now, and that thread ends them.
+    enum { MANY = 64 };
+    uint64_t r0 = a >> FRZ_SHIFT, r1 = (a + n - 1 < RT_ADDRESS_LIMIT ? a + n - 1 : RT_ADDRESS_LIMIT - 1) >> FRZ_SHIFT;
+    for (uint64_t r = r0; r <= r1;) {
+        uint64_t mine[MANY], theirs[MANY];
+        int nm = 0, nt = 0;
+        for (; r <= r1 && nm < MANY && nt < MANY; r++) {
+            if (thaw_begin_locked(r, 2)) {
+                __atomic_store_n(&frz[r], FRZ_THAWING, __ATOMIC_RELEASE);
+                mine[nm++] = r;
+            } else if (frz[r] == FRZ_THAWING) {
+                theirs[nt++] = r;
+            }
+        }
+        if (!nm && !nt) continue;
+        plat_mutex_unlock(&frz_lock);
+        for (int i = 0; i < nm; i++) thaw_pages(mine[i], 0);
+        for (int i = 0; i < nt; i++) thaw_pages(theirs[i], 0);
+        plat_add64(&frz_async_n, nm);
+        plat_mutex_lock(&frz_lock);
+        for (int i = 0; i < nm; i++) thaw_end_locked(mine[i], 2);
+    }
     plat_mutex_unlock(&frz_lock);
 }
 
@@ -717,6 +892,13 @@ static int freeze_locked(uint64_t r) {
             while (i--) plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_RW);
             return 0;
         }
+    // the runs, for a thaw without VirtualQuery (thaw_pages); kept per region from its first freeze on
+    if (n && !frz_runs[r]) frz_runs[r] = calloc(1, sizeof *frz_runs[r]);
+    if (frz_runs[r]) {
+        frz_runs[r]->n = (uint8_t)n;
+        for (int i = 0; i < n; i++)
+            frz_runs[r]->run[i][0] = (uint16_t)((run[i][0] - a) >> 12), frz_runs[r]->run[i][1] = (uint16_t)((run[i][1] - a) >> 12);
+    }
     return n > 0;
 }
 
@@ -725,9 +907,12 @@ int mem_freeze(uint64_t a) {
     uint64_t r = a >> FRZ_SHIFT;
     int ok = 0;
     plat_mutex_lock(&frz_lock);
+    uint32_t now = (uint32_t)plat_now_ms();
     if (frz[r]) ok = 1;
-    else if (thaw_ms[r] && (int32_t)((uint32_t)plat_now_ms() - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
+    else if (thaw_ms[r] && (int32_t)(now - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
+    else if (frz_hot_until[r] && (int32_t)(frz_hot_until[r] - now) > 0) ok = 0;         // hot: held thawed
     else if (freeze_locked(r)) {
+        frz_ms[r] = now | 1;
         __atomic_store_n(&frz[r], 1, __ATOMIC_RELEASE);
         plat_inc32(&nfrz);
         plat_inc64(&frz_count[0]);
@@ -838,8 +1023,10 @@ void mem_probe_report(uint64_t frame) {
     }
 }
 
-void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws) {
+void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws,
+                      uint64_t *hot_holds) {
     *frozen = (uint64_t)__atomic_load_n(&nfrz, __ATOMIC_RELAXED);
+    *hot_holds = (uint64_t)plat_xchg64(&frz_hot_holds, 0);
     *freezes = (uint64_t)plat_xchg64(&frz_count[0], 0);
     *fault_thaws = (uint64_t)plat_xchg64(&frz_count[1], 0);
     *other_thaws = (uint64_t)plat_xchg64(&frz_count[2], 0) + (uint64_t)plat_xchg64(&frz_count[3], 0);
@@ -850,9 +1037,30 @@ void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws
 // The platform's write-fault hook (plat_mem_fault_hook): 1 retries the write.
 static int thaw_fault(uint64_t a) {
     if (a >= RT_ADDRESS_LIMIT || !watched(a, 1)) return 0;
+    uint64_t r = a >> FRZ_SHIFT;
     plat_mutex_lock(&frz_lock);
-    int was = frz[a >> FRZ_SHIFT];
-    thaw_locked(a >> FRZ_SHIFT, 1);
+    int was = frz[r];
+    if (was == FRZ_THAWING) {   // another thread's thaw: the write runs again once it ended
+        while (frz[r] == FRZ_THAWING) {
+            plat_mutex_unlock(&frz_lock);
+            plat_wait_ns(20000);
+            plat_mutex_lock(&frz_lock);
+        }
+        plat_mutex_unlock(&frz_lock);
+        return 1;
+    }
+    if (frz_async && was == 1) {   // its pages outside the lock (FRZ_THAWING)
+        thaw_begin_locked(r, 1);
+        __atomic_store_n(&frz[r], FRZ_THAWING, __ATOMIC_RELEASE);
+        plat_mutex_unlock(&frz_lock);
+        thaw_pages(r, 0);
+        plat_inc64(&frz_async_n);
+        plat_mutex_lock(&frz_lock);
+        thaw_end_locked(r, 1);
+        plat_mutex_unlock(&frz_lock);
+        return 1;
+    }
+    thaw_locked(r, 1);
     plat_mutex_unlock(&frz_lock);
     if (was) return 1;
     uint64_t end;
@@ -862,6 +1070,7 @@ static int thaw_fault(uint64_t a) {
 // Mapping changes thaw the regions they touch and run under frz_lock, so no freeze sees them half done.
 static void commit(uint64_t a, uint64_t n, const char *what) {
     plat_mutex_lock(&frz_lock);
+    thaw_wait_locked(a, n);
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_commit(a, n);
     plat_mutex_unlock(&frz_lock);
@@ -870,6 +1079,7 @@ static void commit(uint64_t a, uint64_t n, const char *what) {
 
 static void decommit(uint64_t a, uint64_t n, const char *what) {
     plat_mutex_lock(&frz_lock);
+    thaw_wait_locked(a, n);
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_decommit(a, n);
     plat_mutex_unlock(&frz_lock);
@@ -878,6 +1088,7 @@ static void decommit(uint64_t a, uint64_t n, const char *what) {
 
 static void protect(uint64_t a, uint64_t n, int prot, const char *what) {
     plat_mutex_lock(&frz_lock);
+    thaw_wait_locked(a, n);
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_protect(a, n, prot);
     plat_mutex_unlock(&frz_lock);
@@ -930,6 +1141,8 @@ void mem_init(void) {
         lz_want = 1;
         lz_chunk = cfg_bool("NX2NAVI_WB_LAZY_CHUNK");
     }
+    const char *fa = cfg_get("NX2NAVI_FREEZE_ASYNC");   // thaws outside frz_lock (FRZ_THAWING); unset: on
+    frz_async = !fa || !*fa || atoi(fa) != 0;
     const char *pool = cfg_get("NX2NAVI_APP_POOL");
     L = (RtGuestLayout){
         .aslr = {low, RT_ADDRESS_LIMIT - low},

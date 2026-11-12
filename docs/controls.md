@@ -90,7 +90,7 @@ The game's *Swap Jump Controls* option trades B and X (jump on B, put away on X)
 |---|---|---|
 | F1 or Esc | Minus and Plus together | open or close the settings menu; the game gets no input while it is open |
 | F10 | L3 + R3 (both stick clicks) | performance overlay: off, frame rate, full panel |
-| F11 | | borderless fullscreen on or off, saved to `nx2navi.ini` |
+| F11 | | borderless fullscreen on or off, saved to `nx2navi.ini`; not with Ctrl, Shift or Alt held, which overlays and capture tools use |
 
 The window opens on the monitor `NX2NAVI_MONITOR` (`monitor` in `nx2navi.ini`) names, and F11 fullscreen covers the monitor the window is on. `nx2navi.exe --list-monitors` prints each monitor's index, name (on Windows its device name too), desktop rectangle, primary flag and DPI without game files; `nx2navi.exe --monitor <value>` sets `NX2NAVI_MONITOR` for one run and wins over the file. The value is `auto` (default), `primary`, an index from the list (counting from 1), or part of a monitor name (on Windows also a device name such as `display3`; on Linux the name carries the connector, such as `dp-2`); when nothing matches, the log lists the monitors and the window is placed as with `auto`. On Wayland a window cannot place itself: only fullscreen (`fullscreen = 1`) opens on the chosen monitor, and a windowed window opens where the compositor puts it.
 

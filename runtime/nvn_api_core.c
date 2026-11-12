@@ -355,10 +355,23 @@ NVN_API(nvnMemoryPoolFlushMappedRange) {
     if (rt_trace & RT_TRACE_PERF) flush_note(0, p, size);
     if (p && off >= 0 && (uint64_t)off < p->size) nvn_pool_flushed(p, (uint64_t)off, size < p->size - (uint64_t)off ? size : p->size - (uint64_t)off);
 }
+int nvn_no_object(Cpu *c, const char *what) {
+    if (arg_x(c, 0)) return 0;
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8)
+        rt_log("nvn: %s of no object (caller %#llx): 0", what, (unsigned long long)c->x[30]);
+    ret_x(c, 0);
+    return 1;
+}
+
 // NVNmemoryPoolFlags nvnMemoryPoolGetFlags(const NVNmemoryPool *p)
-NVN_API(nvnMemoryPoolGetFlags) { ret_x(c, ((const pool_t *)arg_p(c, 0))->flags); }
+NVN_API(nvnMemoryPoolGetFlags) {
+    if (nvn_no_object(c, "nvnMemoryPoolGetFlags")) return;
+    ret_x(c, ((const pool_t *)arg_p(c, 0))->flags);
+}
 // void *nvnMemoryPoolMap(const NVNmemoryPool *p): NULL for CPU_NO_ACCESS
 NVN_API(nvnMemoryPoolMap) {
+    if (nvn_no_object(c, "nvnMemoryPoolMap")) return;
     const pool_t *o = arg_p(c, 0);
     if (o->magic != NVN_POOL_MAGIC || (o->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) { ret_x(c, 0); return; }
     ret_x(c, (uintptr_t)o->mem);
@@ -414,7 +427,10 @@ NVN_API(nvnMemoryPoolMapVirtual) {
     ret_x(c, 1);
 }
 // NVNbufferAddress nvnMemoryPoolGetBufferAddress(const NVNmemoryPool *p)
-NVN_API(nvnMemoryPoolGetBufferAddress) { ret_x(c, (uintptr_t)((const pool_t *)arg_p(c, 0))->mem); }
+NVN_API(nvnMemoryPoolGetBufferAddress) {
+    if (nvn_no_object(c, "nvnMemoryPoolGetBufferAddress")) return;
+    ret_x(c, (uintptr_t)((const pool_t *)arg_p(c, 0))->mem);
+}
 
 // ---------- Buffers: they reference their pool and own no storage
 // void nvnBufferBuilderSetDevice(NVNbufferBuilder *b, NVNdevice *d)
@@ -448,9 +464,35 @@ NVN_API(nvnBufferInitialize) {
 // void nvnBufferFinalize(NVNbuffer *b)
 NVN_API(nvnBufferFinalize) { memset(arg_p(c, 0), 0, sizeof(buf_t)); }
 static uint64_t buf_address(const buf_t *o) { return o->pool && o->pool->mem ? (uintptr_t)o->pool->mem + (uint64_t)o->off : 0; }
+// The mapping of a buffer with no pool behind it (no buffer, or one whose nvnBufferInitialize failed): memory of its
+// own, zero at first, instead of address 0, since the game's scene-loading thread has been seen filling such a mapping
+// (0x3d0 bytes) without looking at it. 64 KiB, or the buffer's size when it records a larger one; a larger block
+// replaces the smaller for later calls, and none is freed (the game may still hold one). Guest addresses are host
+// addresses.
+static uint64_t no_pool_mapping(const buf_t *o, uint64_t lr) {
+    static uint8_t first[64 << 10] __attribute__((aligned(256)));
+    static void *block = first;
+    static uint64_t block_size = sizeof first;
+    static int told;
+    static PlatMutex mu = PLAT_MUTEX_INIT;
+    uint64_t want = o && o->magic == BUF_MAGIC && o->size <= (256ull << 20) ? o->size : 0;
+    plat_mutex_lock(&mu);
+    if (want > block_size) {
+        void *b = calloc(1, want);
+        if (b) block = b, block_size = want;
+    }
+    void *r = block;
+    if (told++ < 4)
+        rt_log("nvn: nvnBufferMap of a buffer with no memory pool (caller %#llx): %llu bytes of scratch memory",
+               (unsigned long long)lr, (unsigned long long)block_size);
+    plat_mutex_unlock(&mu);
+    return (uintptr_t)r;
+}
 // void *nvnBufferMap(const NVNbuffer *b): NULL in a GPU-window pool, which has no CPU view
 NVN_API(nvnBufferMap) {
-    uint64_t a = buf_address(arg_p(c, 0));
+    const buf_t *o = arg_p(c, 0);
+    if (!o || !o->pool) { ret_x(c, no_pool_mapping(o, c->x[30])); return; }
+    uint64_t a = buf_address(o);
     ret_x(c, nvn_gpu_only(a) ? 0 : a);
 }
 // NVNbufferAddress nvnBufferGetAddress(const NVNbuffer *b)
@@ -712,7 +754,11 @@ NVN_API(nvnQueueSubmitCommands) {
     // several guest threads submit at once (the pause menu's first frame on): a plain ++ lost counts, and with one the
     // frame's first submission went without its wait, or a later one waited
     int idx = __atomic_fetch_add(&nvn_submits_in_frame, 1, __ATOMIC_RELAXED);
-    if (finish_mask && f && (finish_mask == -1 || (idx < 63 && (finish_mask >> idx & 1)))) gfx_backend()->exec_wait(f, UINT64_MAX);
+    if (finish_mask && f && (finish_mask == -1 || (idx < 63 && (finish_mask >> idx & 1)))) {
+        gfx_tl_note('W', 0, f, 0);
+        gfx_backend()->exec_wait(f, UINT64_MAX);
+        gfx_tl_note('w', 0, 0, 0);
+    }
     nvn_call_note(0, (uintptr_t)q, 0);
 }
 

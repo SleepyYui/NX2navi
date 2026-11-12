@@ -82,6 +82,11 @@ typedef struct {
     int64_t ts0;
     uint64_t shown0_ns;
     int clock_on;
+    // The game fetches pictures ahead into a list of its own (main+0x3b61df0) and lets go of each when the next one
+    // takes its place on screen (ReleaseVideoFrame), so the distance to real time is measured there too: the newest
+    // released picture's, and how far it moved since the first released one (the drift), in ns
+    int64_t rel_lag, rel_lag0;
+    int rel_on;
 } Video;
 
 static Video *video_of(void *obj) { return obj ? *(Video **)obj : NULL; }
@@ -588,7 +593,7 @@ static void ov_initialize(Cpu *c) {
     Video *v = *slot;
     finalize(v);
     set_live(v, 1);
-    v->clock_on = 0;
+    v->clock_on = v->rel_on = 0;
     Dav1dSettings s;
     dav1d_default_settings(&s);
     // Frame threading on (dav1d picks the delay): heavy stretches of the title movie took longer than a frame to
@@ -674,7 +679,7 @@ static void ov_flush(Cpu *c) {
     if (v) {
         plat_mutex_lock(&v->lock);
         v->generation++;   // the decoder and convert threads drop what they are making
-        v->clock_on = 0;   // a seek: the report's real-time reference starts again from the next picture
+        v->clock_on = v->rel_on = 0;   // a seek: the report's real-time reference starts again from the next picture
         clear_queues(v);
         clear_converts(v);
         plat_mutex_unlock(&v->lock);
@@ -805,9 +810,10 @@ static void ov_acquire(Cpu *c) {
             rt_log("movie: pacing over 600 frames: acquire gap avg %.2f ms, max %.2f ms; %d pictures waiting; "
                    "per frame shown: decoder thread waiting for samples %.2f ms, send %.2f ms, get %.2f ms; convert thread "
                    "%.2f ms per picture (%llu pictures); "
-                   "picture %.0f ms behind real time since the first picture",
+                   "picture %.0f ms behind real time since the first picture; on screen %.0f ms behind, %+.0f ms since its start",
                    sum_gap / 600 / 1e6, max_gap / 1e6, v->qn, t_wait_ns / 600 / 1e6, t_send_ns / 600 / 1e6,
-                   t_get_ns / 600 / 1e6, n_made ? t_make_ns / n_made / 1e6 : 0.0, (unsigned long long)n_made, lag / 1e6);
+                   t_get_ns / 600 / 1e6, n_made ? t_make_ns / n_made / 1e6 : 0.0, (unsigned long long)n_made, lag / 1e6, v->rel_lag / 1e6,
+                   (v->rel_lag - v->rel_lag0) / 1e6);
             t_wait_ns = t_send_ns = t_get_ns = t_make_ns = n_made = 0;
             sum_gap = max_gap = 0;
         }
@@ -816,7 +822,12 @@ static void ov_acquire(Cpu *c) {
     update_events(v);
     plat_mutex_unlock(&v->lock);
     if (p.rgba) gfx_movie_frame_own(p.rgba, p.w, p.h), p.rgba = NULL;   // the overlay takes the buffer
-    if (p.eos) gfx_movie_stop(), set_live(v, 0);
+    if (p.eos) {   // how the movie kept time: the picture on screen against the clock, at its start and its end
+        if (v->rel_on)
+            rt_log("movie: end of stream after %llu pictures: on screen %.0f ms behind real time, %+.0f ms since its start",
+                   (unsigned long long)v->shown, v->rel_lag / 1e6, (v->rel_lag - v->rel_lag0) / 1e6);
+        gfx_movie_stop(), set_live(v, 0);
+    }
     picture_free(&p);
     *out = v->frame[f];
     ret_x(c, 0);
@@ -828,7 +839,15 @@ static void ov_release(Cpu *c) {
     if (v) {
         plat_mutex_lock(&v->lock);
         for (int i = 0; i < v->nframe; i++)
-            if (v->frame[i] == fr) v->busy[i] = 0;
+            if (v->frame[i] == fr) {
+                v->busy[i] = 0;
+                int64_t ts;
+                memcpy(&ts, (uint8_t *)(uintptr_t)fr + 0x78, 8);
+                if (v->clock_on && !((uint8_t *)(uintptr_t)fr)[0x88]) {
+                    v->rel_lag = (int64_t)(plat_now_ns() - v->shown0_ns) - (ts - v->ts0);
+                    if (!v->rel_on) v->rel_lag0 = v->rel_lag, v->rel_on = 1;
+                }
+            }
         update_events(v);
         plat_mutex_unlock(&v->lock);
     }

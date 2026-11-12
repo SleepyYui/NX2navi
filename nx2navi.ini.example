@@ -66,6 +66,10 @@
 # of latency, and can show a dark or flickering frame now and then: the other thread reads vertex and buffer memory
 # the game has sometimes rewritten by then.
 # replay_async = 0
+# EXPERIMENTAL, work in progress. Record the draws of a submission on replay worker threads, 0 to 16. Default: 0, the
+# replay records everything on one thread. With 1 a worker records each long run of draws while the submitting thread
+# waits for it: no faster yet, it checks that the pictures stay the same before several workers record at once.
+# replay_workers = 0
 # EXPERIMENTAL, THE GAME CRASHES WITH 1. 1 lifts the virtual core gate: guest threads run without the console's limit
 # of one thread per core, and the game keeps per-core data without locks. With 1 the game crashes or hangs,
 # usually at start. Keep 0 to play.
@@ -74,7 +78,8 @@
 # timer_1ms = 1
 # The thread that records the GPU work (the first to spend half a second doing it, not the one that submits first) keeps
 # the highest scheduling priority (recorder_prio), and a core of its own that the process's other threads stay off
-# (recorder_core: auto = with 12 or more logical processors, 1 always, 0 never). That is a fast core, with both of its
+# (recorder_core: auto = with 12 or more logical processors, unless the game runs on the cache die below, 1 always,
+# 0 never). That is a fast core, with both of its
 # logical processors: on Windows the highest-numbered core of the fastest efficiency class; on Linux the performance
 # core that clocks highest on a hybrid CPU (else the core of the highest capacity or clock), and none when fewer than
 # four cores are that fast. The log names the thread and its logical processors.
@@ -96,7 +101,8 @@
 # dyn_res_target = 16.7
 # dyn_res_step = 45
 # Processors. On a processor whose dies have L3 caches of different sizes (AMD's two-die X3D processors, with 3D
-# V-Cache on one die) the game runs on the die with the larger cache: 1 = on, 0 = Windows places the threads.
+# V-Cache on one die) the game runs on the die with the larger cache when that die has 8 cores or more: 1 = on,
+# 0 = Windows places the threads.
 # cache_die = 1
 # One logical processor of each physical core, so no two busy threads share a core: 1 = on, 0 = all of them.
 # one_per_core = 0
@@ -219,6 +225,9 @@
 # heap is under 20 GiB or the system reports less than 47 GiB of RAM (allowing for a nominal 48 GiB PC). If the RAM
 # size is unknown, only the GPU heap decides. Look for "NX2NAVI_ASTC_BC unset" in the game log to see the decision.
 # astc_bc = 1
+# With BC3 on: a texture none of whose texels is see-through is BC1, half the size of BC3 with the same texels (each
+# upload checks the blocks as it copies them). 0: every ASTC texture BC3.
+# astc_bc1 = 1
 # Game memory shared with the GPU: auto (mirror on a discrete GPU, import on an integrated one), import (host memory
 # imported into Vulkan), mirror (pools used as buffers get a copy in video memory) or verify (mirror plus a check of
 # every copy; slow). On a discrete GPU import can be far slower than mirror, not slightly slower: the GPU reads the
@@ -239,11 +248,11 @@
 # texture (0 = the CPU untiles the blocks first).
 # astc_gpu_deswizzle = 1
 # With astc = gpu: 1 keeps the decoder's scratch buffer from one upload batch to the next instead of making it again for
-# each, to shorten the hitches when an area loads (0 = one per batch; off until a play test measures it).
-# astc_scratch_keep = 0
+# each, to shorten the hitches when an area loads (0 = one per batch).
+# astc_scratch_keep = 1
 # With astc = gpu: 1 stages a texture's ASTC blocks in the shared staging ranges instead of a buffer of their own
-# (0 = a buffer each; off until a play test measures it).
-# astc_arena = 0
+# (0 = a buffer each).
+# astc_arena = 1
 # A render target that needs an image of its own takes the image of a released one of the same size and format
 # instead of making a new one (0 = always a new image).
 # tex_reuse = 1
@@ -266,10 +275,11 @@
 # which game memory gets no copy in video memory (memory = mirror), which costs far more frame time than a texture
 # uploaded again. 0: textures never give way for video memory.
 # tex_vram_pressure = 80
-# Megabytes this process may commit before textures give way as they do while the system's commit runs low. Windows
-# counts video memory against the commit; with a discrete GPU the video memory in use is left out of the comparison,
-# since it is not in RAM. Default: the installed memory, at least 24576, so that it does not depend on the size of the
-# page file. 0: no bound of its own; only the system's commit counts. On Linux it counts the
+# Megabytes of this process's commit above which the log says so. Windows counts video memory against the commit;
+# with a discrete GPU the video memory in use is left out of the comparison, since it is not in RAM. Textures no longer
+# give way at this bound: dropping one lowers both sides of the comparison alike, so nothing they could do brought the
+# process under it, and the ground flickered white while the system had commit to spare. They give way only while the
+# system's commit runs low. Default: the installed memory, at least 24576. 0: no bound. On Linux it counts the
 # process's resident anonymous memory, which stays under the installed memory, so there only a smaller value holds.
 # tex_proc_commit_mb = 32768
 # 1: a texture the game releases or takes back, with nothing else changed at its address, puts the texture table's
@@ -400,11 +410,11 @@
 # window is no longer stretched as it used to be; stretch fills the window. Changes while the game runs take effect at
 # once.
 # aspect = fit
-# Anisotropic filtering of surface textures: game (the level the game asks for, as on the Switch) or 2, 4, 8, 16. Keeps
-# ground, roads and walls seen at a shallow angle sharp into the distance. Only filtered, mipmapped textures that tile
-# are raised; shadow maps, data maps and screen-sized buffers keep the game's setting. Changes while the game runs take
-# effect at once.
-# aniso = game
+# Anisotropic filtering of surface textures: game (the level the game asks for, as on the Switch, 1x or 2x) or 2, 4,
+# 8, 16. Default: 16. Keeps ground, roads and walls seen at a shallow angle sharp into the distance. Only filtered,
+# mipmapped textures that tile are raised; shadow maps, data maps and screen-sized buffers keep the game's setting.
+# Changes while the game runs take effect at once.
+# aniso = 16
 # Texture detail: auto, full, reduced or low. The textures of a loaded area are what fills a card with little video
 # memory, and three quarters of a texture is its largest mip level. reduced makes the large surface textures (256x256 and
 # more, with smaller levels) without that level, low without the two largest when they are 1024x1024 or more. Surfaces
@@ -489,8 +499,13 @@
 # frame before, DLSS is told to favour the current frame by this percentage (0, 35, 65 or 100; 0 off). Higher removes
 # more of the trails and leaves those edges a little less smooth. Changes while the game runs take effect at once.
 # dlss_char_mask = 65
-# The game's own FXAA after the post effects; with DLAA on it is not needed. Changes while the game runs take effect at
-# once.
+# Anti-aliasing of the 3D picture: game (the game's own SMAA, as on the console), off, fxaa, smaa (SMAA at its Ultra
+# preset in the game's place) or taa (DLSS or FSR 3.1 at full size: dlaa = 1 with dlss = dlaa, which the menu's
+# Anti-aliasing row sets with it). While DLSS or FSR 3.1 runs, the game's SMAA stays whatever this says. Changes while
+# the game runs take effect at once.
+# aa = game
+# The FXAA switch of the game this runtime was first written for; Ocarina has no such pass, so it changes nothing here
+# (aa above is the setting).
 # fxaa = 1
 # Frame generation: off, fsr3 (AMD FSR 3.1 on any GPU where amd_fidelityfx_vk.dll loads, so not on Linux: one generated
 # frame between every two the game draws, the HUD kept out of it) or dlss (NVIDIA DLSS Frame Generation on GeForce RTX
@@ -512,11 +527,12 @@
 # take effect at once.
 # framegen_multiplier = 2
 
-# HDR output: hdr = 1 sends the picture as HDR10 through the HDR tone mapper, hdr = native as the game renders it in
-# its own HDR mode (both need HDR on in Windows, "Use HDR", or a Wayland compositor with colour management; without it
-# the picture stays SDR, the game's own). hdr_peak_nits is your display's peak; hdr_game_nits the picture's white
-# (paper white, 203 is the HDR reference) and hdr_ui_nits the HUD's and the menu's. Everything applies at once, also
-# hdr between 0 and 1; only hdr = native, which the game itself takes up, waits for the next start.
+# HDR output, two kinds (both need HDR on in Windows, "Use HDR", or a Wayland compositor with colour management;
+# without it the picture stays SDR, the game's own): hdr = 1 sends the game's scene tone mapped to your display, one
+# fixed look, and applies at once; hdr = native shows the game's own HDR mode, which the game takes up at the next
+# start. hdr_peak_nits is your display's peak, hdr_game_nits the picture's white (paper white, 203 is the HDR
+# reference) and hdr_ui_nits the HUD's and the menu's. The settings of the look of earlier versions
+# (hdr_tonemap, hdr_exposure, hdr_gamma and the rest) are read by nothing now and do no harm.
 # hdr = 0
 # hdr_live = 0 leaves the HDR path out of a run that starts with hdr = 0, as before hdr followed the menu: switching
 # HDR on then takes a restart. Only worth setting if the picture differs with it at 1.
@@ -524,36 +540,6 @@
 # hdr_peak_nits = 1000
 # hdr_game_nits = 203
 # hdr_ui_nits = 203
-# With hdr = 1, the tone mapper: vanilla is the game's own curve at SDR brightness; psychov35 sends the scene through a
-# model of the eye's response, matched to the game's mid grey and tone, up to the peak; renodrt carries the game's SDR
-# look up to the peak by brightness.
-# hdr_tonemap = psychov35
-# With psychov35: where the scene's mid grey lands (vanilla: where the game's curve puts it; render: at the scene's
-# value); whether the mid tones get the contrast of the game's curve; the tone curve's steepness through mid grey from
-# 0 to 100 (50 unchanged); and in percent how much bright colours turn as where the game's SDR picture clips (fire
-# towards yellow and white).
-# hdr_midgray = vanilla
-# hdr_match_slope = 1
-# hdr_tone_slope = 50
-# hdr_hue_clip = 50
-# With psychov35 and renodrt: exposure in percent (100 unchanged); highlights, shadows, contrast and saturation from 0
-# to 100 (50 unchanged).
-# hdr_exposure = 100
-# hdr_highlights = 50
-# hdr_shadows = 50
-# hdr_contrast = 50
-# hdr_saturation = 50
-# With renodrt: gamma correction (off, 2.2 or 2.4) shows the picture as a display of that power would, off keeps the
-# sRGB curve; highlight saturation from 0 to 100 (50 unchanged); blowout (bright parts towards white) and flare (lifted
-# blacks) from 0 to 100 (0 none); hue correction in percent (how much bright colours keep their hue); grade, the
-# percentage of the game's own colour grading the picture keeps.
-# hdr_gamma = 2.2
-# hdr_highlight_sat = 50
-# hdr_blowout = 0
-# hdr_flare = 0
-# hdr_hue = 100
-# hdr_grade = 100
-
 [language]
 # Language: a Windows locale such as de-DE, or a Switch code (en-US, ja, zh-Hant, ...). Default: the Windows locale.
 # locale = en-US
@@ -776,6 +762,10 @@
 # Extra lines in the log, comma separated: svc, host, ipc, fs, gfx, perf, sched, audio, present, coop or all. The menu's
 # Performance log sets perf (frame timings). Default: none.
 # trace = perf
+# A game thread that waits this many seconds for a lock, or for another thread to end, is logged once with the thread
+# it waits for and what that one is doing (at most 24 lines a run): a game that stops then leaves the chain in its log.
+# Off by default: its thread takes the game's thread lock every 2 seconds. 10 is a good value for a hang report.
+# wait_watch_s = 0
 # 1: with trace = perf, walks of the process's address space count its private and write-combined memory every 600
 # frames (the "mem: process" line) and where its committed memory lies every 3600 frames (the "commit census" lines).
 # Each walk holds the address-space lock for 100-240 ms and delays the next frame by as much, so they are off unless
@@ -790,9 +780,6 @@
 # everything in it is freed, so smaller blocks hold less free space after area changes; larger ones need fewer
 # allocations while an area loads. Default: 64.
 # vma_block_mb = 64
-# 1: samples each new ASTC texture's blocks on the CPU and logs how many are opaque ("ASTC alpha probe" lines), which
-# could be stored at half the video memory. Slows area loads. Default: 0.
-# astc_bc_probe = 0
 # Flight recorder: keeps the last frames and saves them to a flight folder next to the folder of nx2navi.exe when a frame
 # takes longer than flight_spike_ms (0 to 60000).
 # flight = 0
@@ -906,6 +893,9 @@
 # Video memory in MB for what those compute passes hand to the draws. A draw that needs more loses the geometry that
 # does not fit, and the log says so.
 # mesh_fallback_mb = 128
+# Threads that prepare those compute passes for the mesh programs a place uses, the first time each is drawn (until
+# then its draws are left out). auto (default): one for each 4 logical processors, 1 to 4.
+# mesh_fallback_workers = auto
 # Windows, 1 (experimental): the game's heap is committed a 64 KiB run at a time where it is first used, instead of
 # all of it when the game sizes it. Windows counts committed memory against RAM plus the page file whether it is used
 # or not, and in Castle Town after Hyrule Field about 3.4 of the heap's 6.8 GiB had never been used. 0: committed up
