@@ -65,6 +65,9 @@ int64_t vk_dlaa_vram(void);
 // frame (vk_dlaa_frame).
 typedef struct VkExec VkExec;
 void vk_dlaa_pass(VkExec *ex);
+// vk_exec_draw.c untranslated_dispatch_fallback, after the stand-in of the game's own upscaler wrote its output image
+// (in GENERAL, of format fmt and w x h): DLSS or FSR runs there on the armed scene and its picture goes over it.
+void vk_dlaa_upscaler(VkExec *ex, VkImage out, VkFormat fmt, uint32_t w, uint32_t h);
 void vk_dlaa_frame(void);
 // 1 once, at the present of the first frame whose scene has a new size after a setting changed (vk_dlaa.c).
 int vk_dlaa_resized_take(void);
@@ -72,6 +75,7 @@ int vk_dlaa_resized_take(void);
 // the viewport of the scene's draws by the frame's jitter (vk_dlaa_viewport, when the viewport is recorded).
 void vk_dlaa_draw(VkExec *ex);
 void vk_dlaa_viewport(VkExec *ex, VkViewport *v);
+void vk_dlaa_pass_end(VkExec *ex);       // vk_exec.c, a pass just ended: the edges of a jittered pass's targets are filled
 void vk_dlaa_jitter_check(VkExec *ex);   // before each draw's fixed state: records the viewport again where its jitter changes
 // vk_mvsurvey.c (NX2NAVI_MV_SURVEY): notes the uniform blocks of each scene draw, beside vk_dlaa_draw; each present
 // compares them with the previous frames' and logs a summary now and then.
@@ -95,3 +99,5 @@ void vk_mvcheck_output(VkCommandBuffer cb, VkImage out, uint32_t ow, uint32_t oh
 // vk_exec_draw.c, once a draw's fragment shader is known: 1 skips the draw (the game's FXAA while NX2NAVI_FXAA is 0, its
 // scaling draw when DLSS wrote the scaled picture).
 int vk_dlaa_skip_draw(VkExec *ex, const GfxShader *fs);
+
+int vk_dlaa_pose_depth(uint64_t frame, uint32_t w, uint32_t h, VkDescriptorImageInfo *image, float history[4]);

@@ -31,6 +31,8 @@ static void plat_mutex_lock(PlatMutex *m) {
  if(!m->lock.try_lock_for(1s)) throw std::runtime_error("target history lock timed out");
 }
 static void plat_mutex_unlock(PlatMutex *m) {m->lock.unlock();}
+// Fills a jittered pass's outer rows or columns; it takes neither lock, so the check leaves it empty.
+static void vk_dlaa_pass_end(VkExec *) {}
 static void vk_texture_gpu_written(uintptr_t) {
  if(second)waiting=true;
  if(!texture.try_lock_for(1s))throw std::runtime_error("texture lock timed out");

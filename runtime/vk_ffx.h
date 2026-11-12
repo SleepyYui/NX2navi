@@ -14,6 +14,8 @@ typedef struct {
 // plane) and the metres in one unit of view space. A field of 0 is not known, and FSR then gets 1 radian, 0.1, 1e8 and
 // 1.
 typedef struct { float fov_y, znear, zfar, meters; } VkFfxCamera;
+// vk_dlaa.c: the share (0..1) of the extra sharpening FSR 3.1 gets at a render width w of an output width ow
+float vk_dlaa_fsr3_boost(uint32_t w, uint32_t ow);
 
 int vk_ffx_load(void);   // 1 when the library is there with its entry points (loaded once)
 // Whether FSR 3.1 upscaling can run in this build, for the settings menu: after vk_ffx_load ran, what it found; before,

@@ -860,6 +860,7 @@ void vk_exec_pass_begin(VkExec *ex) {
         m->step = ex->mark_passes++;
         m->w = ex->pass_w, m->h = ex->pass_h, m->d = ex->pass_layers;
         m->layer = ex->depth.image ? ex->depth.base_layer : 0;
+        m->vw = m->vh = 0;
         m->ncolor = (uint8_t)(ex->pass_ncolor < 8 ? ex->pass_ncolor : 8);
         for (int i = 0; i < m->ncolor; i++) m->color[i] = ex->pass_color[i];
         m->depth = ex->pass_depth ? ex->pass_depth : ex->pass_stencil;
@@ -899,8 +900,11 @@ void vk_exec_pass_end(VkExec *ex) {
             bc_copy_back(ex, &ex->color[i]);
     if (vk_dump_armed) vk_dump_pass_end(ex);
     uint64_t stamp = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
-    // Mark targets before taking the history lock. An inline texture operation can end a pass while already holding
-    // the texture lock; taking these locks in the opposite order on another replay worker deadlocks both workers.
+    // The targets are marked written outside tfr_lock: vk_texture_gpu_written takes the texture lock, and a chunk that
+    // holds the texture lock can end its pass here (a lookup's alias copy, vk_exec_inline_begin) and then wait for
+    // tfr_lock. Taken the other way round, a chunk holding tfr_lock and waiting for the texture lock deadlocked with it,
+    // the other chunks spinning in their turns (the loading screen after Continue, 3 replay workers). tfr_lock guards
+    // only the target history and takes no other lock inside.
     for (int i = 0; i < 8; i++)
         if (ex->color[i].image) vk_texture_gpu_written(ex->color[i].tex);
     if (ex->depth.image) vk_texture_gpu_written(ex->depth.tex);
@@ -916,6 +920,7 @@ void vk_exec_pass_end(VkExec *ex) {
         tfr_note(&ft, stamp);
     }
     if (lk) plat_mutex_unlock(&tfr_lock);
+    vk_dlaa_pass_end(ex);   // a jittered pass left its targets' outer rows or columns undrawn
 }
 
 VkCommandBuffer vk_exec_inline_begin(int *reopen) {
@@ -1115,7 +1120,19 @@ static void set_rt(VkExec *ex, const p_set_rt *r) {
 // command, it was 4% of the replay in Kokiri Forest.
 static int split_n = -1, split_idle, split_in_pass, split_draws, split_at, part_start;
 static uint64_t split_ns, part_t0;
-static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits;
+static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits, n_cuts;
+
+int vk_exec_split_now(VkExec *ex) {
+    int in_pass = ex->in_pass;
+    if (in_pass) vk_exec_pass_end(ex);
+    VkCommandBuffer cb = vk_sync_cut();   // not handed to the queue: the texture pool set stays (vk_exec_pool_split)
+    if (!cb) return 0;
+    ex->cb = cb;
+    ex->dirty = VK_EXEC_DIRTY_ALL;
+    vk_exec_draw_new_cb();
+    n_cuts++;
+    return 1;
+}
 
 static int split_wanted(void) {
     if (split_draws >= split_at) return 1;
@@ -2086,9 +2103,10 @@ static uint32_t group_peek(const VkExec *ex, const op_hdr *h, const op_hdr **end
     int begun = 0;
     const p_set_rt *rt = &ex->rt;
     *why = GE_LIMIT;
-    // mesh draws stay on the submitting thread with the mesh fallback (its buffers are shared) and while
-    // NX2NAVI_GPU_PASSES copies their workgroup counts (one list)
-    int mesh_serial = vk_ctx()->mesh_fallback || vk_gpu_passes_capturing();
+    // mesh draws stay on the submitting thread with the mesh fallback (its buffers are shared), with the mesh emulation
+    // (no VK_EXT_mesh_shader: its arena, queue and the part's pre-pass command buffer are the submitting thread's) and
+    // while NX2NAVI_GPU_PASSES copies their workgroup counts (one list)
+    int mesh_serial = vk_ctx()->mesh_fallback || !vk_ctx()->has_mesh_shader || vk_gpu_passes_capturing();
     for (uint32_t ops = 0; ops < GROUP_PEEK; ops++) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_) { *why = GE_RUN; break; }   // the walk reports it
         const void *a = nvn_op_payload(h);
@@ -2583,10 +2601,10 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     if (n) n_subs++;
     if ((rt_trace & RT_TRACE_PERF) && n_subs >= 240) {
         rt_log("perf: replay command buffer parts per submission %.2f (%.2f first parts sent while the GPU was idle, %.2f "
-               "splits inside a pass); event order: held %llu, resumed %llu (%llu without their signal), switches %llu, "
+               "splits inside a pass, %.2f cuts for emulated mesh stages); event order: held %llu, resumed %llu (%llu without their signal), switches %llu, "
                "held now %d; waits a CPU signal met only after the submission's copies were taken: %llu",
                (double)(n_subs + n_parts) / (double)n_subs, (double)n_idle_parts / (double)n_subs,
-               (double)n_pass_splits / (double)n_subs, (unsigned long long)evo_held, (unsigned long long)evo_resumed,
+               (double)n_pass_splits / (double)n_subs, (double)n_cuts / (double)n_subs, (unsigned long long)evo_held, (unsigned long long)evo_resumed,
                (unsigned long long)evo_forced, (unsigned long long)evo_switches, evo_pending,
                (unsigned long long)vk_exec_event_late_take());
         uint64_t xw, xe, xl, xm, le, lc, lo;
@@ -2678,7 +2696,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
         }
         RW.groups = RW.group_draws = RW.chunks = RW.serial_draws = RW.wait_ns = 0;
         evo_held = evo_resumed = evo_forced = evo_switches = 0;
-        n_subs = n_parts = n_idle_parts = n_pass_splits = 0;
+        n_subs = n_parts = n_idle_parts = n_pass_splits = n_cuts = 0;
     }
     rec_spent_ns += kern_now_ns() - in_ns;
     if (rec_spent_ns >= REC_CLAIM_NS) rec_claim();

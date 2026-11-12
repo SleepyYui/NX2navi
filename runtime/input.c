@@ -533,6 +533,50 @@ static void pad_primary(SDL_Gamepad *p, const char *why) {
            pad_east_a ? "labelled A" : "not labelled A");
 }
 
+// Joysticks SDL has no gamepad mapping for are not gamepads to it, and this file opens gamepads only. Known ones get a
+// mapping built from their own GUID (so it matches whatever bus, version and name checksum SDL put in it); any other is
+// logged once with its name, ids and GUID.
+// - A Switch that presents its Joy-Con over USB from its boot menu's tools:
+//   "Nyx Joy-Con", VID 0x11EC, PID 0xA7E1, a plain HID joystick: X, Y (left stick), Z, Rz (right stick) from 0 to 255
+//   with up at 0, a hat for the D-pad, and buttons 1-12 B, A, Y, X (south, east, west, north), L, R, ZL, ZR, Minus,
+//   Plus, left and right stick clicks. Capture and Home are not sent.
+static const struct { uint16_t vid, pid; const char *name, *map; } known_joysticks[] = {
+    {0x11EC, 0xA7E1, "Nyx Joy-Con (USB HID)",
+     "a:b0,b:b1,x:b2,y:b3,leftshoulder:b4,rightshoulder:b5,lefttrigger:b6,righttrigger:b7,back:b8,start:b9,leftstick:b10,"
+     "rightstick:b11,dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,leftx:a0,lefty:a1,rightx:a2,righty:a3"},
+};
+
+static void map_joysticks(void) {
+    static SDL_JoystickID seen[32];
+    static int nseen;
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetJoysticks(&n);
+    for (int i = 0; ids && i < n; i++) {
+        int done = 0;
+        for (int k = 0; k < nseen && !done; k++) done = seen[k] == ids[i];
+        if (done || SDL_IsGamepad(ids[i])) continue;
+        if (nseen < (int)(sizeof seen / sizeof *seen)) seen[nseen++] = ids[i];
+        uint16_t vid = SDL_GetJoystickVendorForID(ids[i]), pid = SDL_GetJoystickProductForID(ids[i]);
+        char guid[64];
+        SDL_GUIDToString(SDL_GetJoystickGUIDForID(ids[i]), guid, (int)sizeof guid);
+        const char *jname = SDL_GetJoystickNameForID(ids[i]);
+        int mapped = 0;
+        for (size_t k = 0; k < sizeof known_joysticks / sizeof *known_joysticks; k++) {
+            if (known_joysticks[k].vid != vid || known_joysticks[k].pid != pid) continue;
+            char m[512];
+            snprintf(m, sizeof m, "%s,%s,%s", guid, known_joysticks[k].name, known_joysticks[k].map);
+            int r = SDL_AddGamepadMapping(m);
+            rt_log("input: joystick \"%s\" (%04x:%04x, GUID %s) mapped as a gamepad (%s)%s%s", jname ? jname : "?", vid, pid,
+                   guid, known_joysticks[k].name, r < 0 ? ": mapping refused, " : "", r < 0 ? SDL_GetError() : "");
+            mapped = 1;
+        }
+        if (!mapped)
+            rt_log("input: joystick \"%s\" (%04x:%04x, GUID %s) has no gamepad mapping in SDL: not used (an SDL mapping "
+                   "in the SDL_GAMECONTROLLERCONFIG environment variable adds one)", jname ? jname : "?", vid, pid, guid);
+    }
+    SDL_free(ids);
+}
+
 // Under lock: closes the gamepads that went away and opens the ones that came; the primary falls back to the first
 // open one when it left. Logs each change.
 // The game is always told one controller is connected, so a disconnect read as nothing pressed and play went on
@@ -540,6 +584,7 @@ static void pad_primary(SDL_Gamepad *p, const char *why) {
 // its place, the menu opens: the player sees it, and it takes the keyboard and mouse until it is closed.
 static void scan_pads(void) {
     int had = pad != NULL;
+    map_joysticks();
     for (int i = 0; i < npads;) {
         if (SDL_GamepadConnected(pads[i])) { i++; continue; }
         rt_log("input: gamepad \"%s\" disconnected", SDL_GetGamepadName(pads[i]) ? SDL_GetGamepadName(pads[i]) : "?");

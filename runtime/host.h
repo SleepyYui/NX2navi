@@ -220,6 +220,8 @@ uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64
 uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
                                                            // the same without the reset: the bits stay for the next
                                                            // mem_written_pages (verify checks only)
+int mem_watched(uint64_t addr, uint64_t size);             // [addr, addr+size) lies inside one of those two ranges, so
+                                                           // one mem_written_pages call can answer for all of it
 int mem_freeze(uint64_t a);                                // makes the 2 MiB region at a (2 MiB aligned, watched,
                                                            // committed PAGE_READWRITE) read-only until a write or
                                                            // mem_thaw thaws it; 1 frozen (or already), 0 refused
@@ -245,6 +247,7 @@ int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t h0, int64_t delta, uint64_t o
 int mem_lazy_armed(uint64_t a, uint64_t n);
 // Copies the ranges src[i] = {address, bytes} of guest memory whose pages read without a fault to dst[i], ok[i] set.
 int mem_copy_readable(uint8_t *const *dst, const uint64_t (*src)[2], int n, uint8_t *ok);
+int mem_lazy_touches(uint64_t a, uint64_t n);   // 0: the CPU can read [a, a + n) without a fault now
 void mem_lazy_window(int open);
 void mem_lazy_release(uint64_t a, uint64_t n);
 void mem_lazy_report(uint64_t frame, uint64_t skipped);

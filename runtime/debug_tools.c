@@ -929,26 +929,62 @@ int dbg_search_next(int mode, uint32_t value) {
 
 static struct {
     volatile int on, capture, sticks;   // the menu's: on; take the game's view at the next update; the sticks fly it
+    volatile int avoid;                 // the menu's: ground avoidance (dbg_pad), off unless asked for
     volatile float speed;               // metres a second
     double pos[3], reach;               // the game thread's: where it is, and the game's distance to its target
     float yaw, pitch;
     uint64_t last_ns, updates;
-    volatile uint32_t ground_bits;      // dbg_freecam_ground: the closest distance seen in the lower view (a float's bits)
+    float ground[9], ground_tan, ground_aspect;   // dbg_freecam_ground's, under ground_lock
     volatile uint64_t ground_ns;        // and when; 0 none
 } fc = {.sticks = 1, .speed = 8.0f, .reach = 5.0};
+static PlatMutex ground_lock = PLAT_MUTEX_INIT;
 
-int dbg_freecam_flying(void) { return fc.on && fc.sticks && !fc.capture; }
+int dbg_freecam_flying(void) { return fc.on && fc.sticks && !fc.capture && fc.avoid; }
+void dbg_freecam_avoid_set(int on) {
+    if ((on != 0) != fc.avoid) rt_log("debug: free camera ground avoidance %s", on ? "on" : "off");
+    fc.avoid = on != 0;
+}
+int dbg_freecam_avoid(void) { return fc.avoid; }
 
 // The replay's thread (vk_dlaa.c fcam_probe): view distances read back from the lower part of the view a few frames
-// ago, 0 where it saw the sky. The closest is kept for dbg_pad.
-void dbg_freecam_ground(const float *dist, int n) {
-    float best = 0;
-    for (int i = 0; i < n; i++)
-        if (dist[i] > 0 && isfinite(dist[i]) && (best == 0 || dist[i] < best)) best = dist[i];
-    uint32_t bits;
-    memcpy(&bits, &best, 4);
-    __atomic_store_n(&fc.ground_bits, bits, __ATOMIC_RELAXED);
+// ago, three rows of three (0.6, 0.78 and 0.96 of the way down; 0.2, 0.5 and 0.8 across), 0 where it saw the sky. Kept
+// for dbg_pad (ground_under).
+void dbg_freecam_ground(const float *dist, int n, float tan_half_y, float aspect) {
+    if (n != 9 || !(tan_half_y > 0) || !(aspect > 0)) return;
+    plat_mutex_lock(&ground_lock);
+    for (int i = 0; i < 9; i++) fc.ground[i] = dist[i] > 0 && isfinite(dist[i]) ? dist[i] : 0;
+    fc.ground_tan = tan_half_y, fc.ground_aspect = aspect;
+    plat_mutex_unlock(&ground_lock);
     __atomic_store_n(&fc.ground_ns, plat_now_ns(), __ATOMIC_RELEASE);
+}
+
+// How far below the camera the ground is, in metres, from the view distances above, or a negative number when they show
+// no ground within reach metres ahead. Each sample is a point of the scene: its height against the camera and its
+// distance ahead follow from the view's angles and the camera's pitch. In each of the three columns the lowest sample
+// counts as ground only when the surface from it to the one above it rises by less than GROUND_SLOPE: the ground the
+// camera flies over, a field or a gentle hill. Whatever stands on it or in front of the camera (a character, a rock, a
+// wall, a tree) is steeper and is left alone, so the camera can go right up to it; taken for ground too, as at first,
+// anything within three metres in the lower view sent the camera upwards on its way to it.
+#define GROUND_SLOPE 0.6   /* rise over run: about 30 degrees */
+static double ground_under(double reach) {
+    float d[9], ty, as;
+    plat_mutex_lock(&ground_lock);
+    memcpy(d, fc.ground, sizeof d), ty = fc.ground_tan, as = fc.ground_aspect;
+    plat_mutex_unlock(&ground_lock);
+    static const double xn[3] = {-0.6, 0.0, 0.6}, yn[3] = {-0.2, -0.56, -0.92};   // the samples in the view, -1..1, up positive
+    double sp = sin(fc.pitch), cp = cos(fc.pitch), best = -1;
+    for (int col = 0; col < 3; col++) {
+        double up[3], run[3];   // per row: the point's height against the camera, and how far ahead it is, level
+        for (int row = 0; row < 3; row++) {
+            double z = d[row * 3 + col], yv = yn[row] * ty * z, xv = xn[col] * ty * as * z, fwd = z * cp - yv * sp;
+            up[row] = yv * cp + z * sp, run[row] = sqrt(fwd * fwd + xv * xv);
+        }
+        if (!(d[6 + col] > 0) || !(d[3 + col] > 0)) continue;   // the lowest sample and the one above it
+        double rise = fabs(up[1] - up[2]), along = fabs(run[1] - run[2]);
+        if (rise > GROUND_SLOPE * along || up[2] >= 0 || run[2] > reach) continue;
+        if (best < 0 || -up[2] < best) best = -up[2];
+    }
+    return best;
 }
 
 static double reg_d(Cpu *c, int r) {
@@ -1110,10 +1146,10 @@ static void route_pad(int32_t *lx, int32_t *ly) {
 }
 
 // The game's thread, with the pad's state before the game gets it: while the free camera has the sticks, the left one
-// moves it level, ahead where it faces and sideways, the right one turns it, ZR and ZL raise and lower it, R makes it
-// four times as fast and L four times as slow, and the game is told that none of those is touched, so Link stays where
-// he is. Its height changes only with ZR and ZL: moved along its view, a camera looking down at the ground flew into
-// it and showed the void below the map, which looks like ground the game failed to draw.
+// moves it where it looks and sideways, the right one turns it, ZR and ZL raise and lower it, R makes it four times as
+// fast and L four times as slow, and the game is told that none of those is touched, so Link stays where he is.
+// Nothing stops it: it goes through walls, objects and the ground, below which the picture shows the void under the
+// map. Ground avoidance (the menu's switch, off unless asked for) keeps it a metre above ground-like surfaces instead.
 void dbg_pad(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     route_pad(lx, ly);
     if (!fc.on || !fc.sticks || fc.capture) {
@@ -1132,24 +1168,25 @@ void dbg_pad(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *
     fc.yaw -= (float)(in[2] * 2.4 * dt);
     fc.pitch += (float)(in[3] * 1.8 * dt);
     fc.pitch = fc.pitch > 1.5f ? 1.5f : fc.pitch < -1.5f ? -1.5f : fc.pitch;
-    double ahead[3] = {sin(fc.yaw), 0, cos(fc.yaw)};    // where it faces, level
+    double cp = cos(fc.pitch), look[3] = {cp * sin(fc.yaw), sin(fc.pitch), cp * cos(fc.yaw)};   // where it looks
     double right[3] = {-cos(fc.yaw), 0, sin(fc.yaw)};   // the view's direction crossed with up
-    for (int i = 0; i < 3; i++) fc.pos[i] += (ahead[i] * in[1] + right[i] * in[0]) * step;
-    // Clear of the ground: where the closest surface in the lower part of the view (vk_dlaa.c fcam_probe, with DLSS,
-    // DLAA or FSR 3.1/4 on) is nearer than the clearance, the camera rises instead of going on into a hill and under
-    // the map, and ZL does not take it lower. The clearance grows with the speed: the distances are a few frames old.
+    double move[3];
+    for (int i = 0; i < 3; i++) move[i] = (look[i] * in[1] + right[i] * in[0]) * step;
+    move[1] += rise * step;
+    // Ground avoidance, when it is on: where the ground under the view (ground_under, from vk_dlaa.c fcam_probe with
+    // DLSS, DLAA or FSR on) is less than a metre below, the camera goes no lower and rises to that metre, instead of
+    // going on into a field or a gentle hill and under the map. Objects and walls do not count. The reach ahead grows
+    // with the speed: the distances are a few frames old.
     uint64_t seen = __atomic_load_n(&fc.ground_ns, __ATOMIC_ACQUIRE);
-    if (seen && now - seen < 300000000ull && dt > 0) {
-        uint32_t bits = __atomic_load_n(&fc.ground_bits, __ATOMIC_RELAXED);
-        float near_m;
-        memcpy(&near_m, &bits, 4);
-        double clear = 2.5 + 0.15 * step / dt;
-        if (near_m > 0 && near_m < clear) {
-            if (rise < 0) rise = 0;
-            fc.pos[1] += (clear - near_m) * (dt * 8 < 1 ? dt * 8 : 1);
+    if (fc.avoid && seen && now - seen < 300000000ull && dt > 0) {
+        const double clear = 1.0;
+        double below = ground_under(3.0 + 0.3 * step / dt);
+        if (below >= 0 && below < clear) {
+            if (move[1] < 0) move[1] = 0;
+            move[1] += (clear - below) * (dt * 8 < 1 ? dt * 8 : 1);
         }
     }
-    fc.pos[1] += rise * step;
+    for (int i = 0; i < 3; i++) fc.pos[i] += move[i];
     *lx = *ly = *rx = *ry = 0;
     *buttons &= ~(zl | zr | l | r);
 }
@@ -1157,7 +1194,8 @@ void dbg_pad(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *
 // ---- NX2NAVI_DBG_TEST="<tick>:flag <hash hex> <0|1>;<tick>:speed <factor>;<tick>:find <value> <size>;
 // <tick>:next <mode> <value>;<tick>:setfirst <value>;<tick>:holdfirst <value>;<tick>:show [<hash hex>];
 // <tick>:warp <area> [<start position>];<tick>:event <name>;<tick>:text <game data text's name>;
-// <tick>:freecam <0|1> <sticks 0|1> <speed>;<tick>:camgo <dx> <dy> <dz> [<yaw> <pitch>];<tick>:camreset;<tick>:campos":
+// <tick>:freecam <0|1> <sticks 0|1> <speed>;<tick>:camavoid <0|1>;<tick>:camgo <dx> <dy> <dz> [<yaw> <pitch>];
+// <tick>:camreset;<tick>:campos":
 // the menu's requests without the menu, for test runs. Ticks count the game's pad reads from the player's first appearance.
 static void test_script(uint64_t tick) {
     static char buf[2048];
@@ -1184,6 +1222,8 @@ static void test_script(uint64_t tick) {
             rt_log("debug: tick %llu: free camera %s at %.3f %.3f %.3f, yaw %.3f, pitch %.3f; %llu camera updates through it",
                    (unsigned long long)tick, fc.on ? "on" : "off", fc.pos[0], fc.pos[1], fc.pos[2], fc.yaw, fc.pitch,
                    (unsigned long long)fc.updates);
+        } else if (!strncmp(colon + 1, "camavoid ", 9)) {   // camavoid <0|1>: the free camera's ground avoidance
+            dbg_freecam_avoid_set(atoi(colon + 10));
         } else if (!strncmp(colon + 1, "freecam ", 8)) {   // freecam <on> <sticks> <speed>
             int cam_on = 0, sticks = 1;
             float speed = 8;

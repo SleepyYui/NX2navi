@@ -58,8 +58,12 @@ int dbg_freecam_available(void);       // the build has the camera's patch set
 void dbg_freecam_set(int on, int sticks, float speed);
 void dbg_freecam_reset(void);          // back to the game's view, free again from there
 int dbg_freecam(int *sticks, float *speed, double pos[3]);   // on or off
-int dbg_freecam_flying(void);          // on, with the sticks: vk_dlaa.c reads the ground's distance back for it
-void dbg_freecam_ground(const float *dist, int n);   // the replay's thread: view distances in the lower view, 0 sky
+int dbg_freecam_flying(void);          // on, with the sticks and ground avoidance: vk_dlaa.c reads the ground's distances back
+void dbg_freecam_avoid_set(int on);    // ground avoidance (off by default): the camera stays a metre above ground-like surfaces
+int dbg_freecam_avoid(void);
+// The replay's thread: nine view distances of the lower view (three rows of three, the top row first; 0 sky), with the
+// tangent of half the view's vertical angle and its width over its height
+void dbg_freecam_ground(const float *dist, int n, float tan_half_y, float aspect);
 
 // Memory: values of 1, 2 or 4 bytes in the game's heap.
 int dbg_search_new(uint32_t value, int size);       // returns the number of places

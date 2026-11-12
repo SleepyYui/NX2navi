@@ -3,8 +3,8 @@
 #pragma once
 #include <stdint.h>
 
-#define FLIGHT_THUMB_W 320
-#define FLIGHT_THUMB_H 180
+#define FLIGHT_THUMB_W 640
+#define FLIGHT_THUMB_H 360
 
 extern int flight_on;
 extern int vk_dump_white;   // vk_dump.c, NX2NAVI_DUMP_WHITE   // NX2NAVI_FLIGHT=1, set once by flight_init before the first present
@@ -20,6 +20,19 @@ void flight_frame(uint64_t frame, uint64_t now_ns, uint64_t interval_ns, const u
 // carries the frame whose counts in frames.tsv it is part of. Any thread: the ring takes no lock. A no-op until
 // flight_init turned the recorder on.
 enum { FLIGHT_TEX_NEW, FLIGHT_TEX_UP, FLIGHT_TEX_REUP, FLIGHT_TEX_RELEASE, FLIGHT_TEX_TAKEBACK, FLIGHT_TEX_DROP,
+       FLIGHT_TEX_BYTES,   // after UP and REUP: what the upload read (detail: a hash of 64 probes of its storage; us:
+                           // how many of the probes were all zero), so a second upload tells new bytes from the same
+       FLIGHT_TEX_REG,     // a slot registered with a CPU-written texture (us: the slot; detail: what it named before:
+                           // 0 nothing, 1 another descriptor at this storage, 2 other storage, 3 a finalized texture)
+       FLIGHT_TEX_BLANK,   // a shader sampled a slot that has no image of its own and follows none: its stand-in was
+                           // on screen (us: the slot; detail: bit 0 the slot is finalized, bit 1 it is held out)
+       FLIGHT_TEX_TOBLANK, // the pool's entry of a slot went from a texture's view to the stand-in (us: the slot;
+                           // detail: vk_texture_slot_why_locked's bits, what the slot's own texture was then)
+       FLIGHT_TEX_BLANKSUB,// a slot that lost its picture during a submission still had none when the next one began:
+                           // the submission's draws read its stand-in (us and detail as TOBLANK)
+       FLIGHT_TEX_DIRECT,  // a draw's own texture binding (not the pool's) named a slot and got the stand-in: that draw
+                           // samples it whatever the slot resolves to later (us and detail as TOBLANK; once a frame)
+       FLIGHT_TEX_UNREG,   // a shader sampled a pool slot that is not registered when its marks are read (us: the slot)
        FLIGHT_TEX_N };
 // The texture's flags: a depth or stencil image, mirrored (the CPU writes its storage), bound into pool memory, an ASTC
 // texture, written by the GPU (VkTexImage.gpu_owned).

@@ -291,6 +291,9 @@ static void crash_handler(const PlatCrash *x) {
     if (foreign_hook(x->module))
         rt_logf("  %s is not part of the game: a recording, overlay or capture program put it into the game. Close that "
                 "program or turn off its Vulkan capture, then start the game again\n", x->module);
+    // what the thread was doing (a pipeline build names its shaders): the stderr note crash_veh writes misses the log
+    const char *note = plat_crash_context_get();
+    if (note) rt_logf("  the thread was %s\n", note);
     uint64_t f = x->module ? 0 : lifted_function(rip);
     if (f) rt_logf("  in lifted function f_%llx = %s\n", (unsigned long long)f, ldr_describe(f, d, sizeof d));
     // abort and invalid parameter: where the host code called it; a fault in another module: the host calls that led

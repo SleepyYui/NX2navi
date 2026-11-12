@@ -43,6 +43,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "mesh_emu_spirv.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_hmap.h"
@@ -84,6 +85,8 @@ static struct {
     int vs_outs_all;                   // NX2NAVI_VS_OUTS: 0 union of paired fragment inputs, 1 (all) all 32 output locations
     int dyn_vi, dyn_clamp, dyn_poly, dyn_blend_en, dyn_blend_eq, dyn_wmask, dyn_a2c;
     int f_logic_op, f_depth_clamp, f_fill_non_solid, f_dual_src, f_full_subgroups;
+    int wide_lines;                      // the device draws lines of other widths than 1 (vk_pipeline_line_width)
+    float line_w[2], line_gran;          // its range of widths and their step
     int cache_control;                 // pipelineCreationCacheControl: a create can ask for the pipeline caches only
     int feedback;                      // NX2NAVI_PIPE_FEEDBACK: 1 count pipeline cache hits, 2 also log each compute and graphics build
     uint64_t cache_loaded;             // bytes of pipeline-cache.bin the driver took at boot
@@ -130,6 +133,8 @@ typedef struct Layout {
     uint32_t n0;                       // independent layouts: b[0..n0) are set 0, the rest set 1
     VkPipelineLayout half[2];          // GPL libraries: {set 0, null}, {null, set 1} (made on first use)
     VkDescriptorUpdateTemplate tpl[2]; // per set (make_tpl); VK_NULL_HANDLE: written with write structs
+    uint8_t emu;                       // NX2NAVI_MESH_EMULATION: a mesh layout whose task and mesh stages run as compute
+    VkDescriptorUpdateTemplate tpl_c;  // emu: set 0's template for the compute bind point
     VkDescriptorSetLayoutBinding b[];
 } Layout;
 
@@ -958,6 +963,12 @@ static int ensure_init(void) {
     P.f_depth_clamp = f2.features.depthClamp;
     P.f_fill_non_solid = f2.features.fillModeNonSolid;
     P.f_dual_src = f2.features.dualSrcBlend;
+    P.wide_lines = f2.features.wideLines && cfg_bool("NX2NAVI_LINE_WIDTH");
+    P.line_w[0] = c->props.limits.lineWidthRange[0], P.line_w[1] = c->props.limits.lineWidthRange[1];
+    P.line_gran = c->props.limits.lineWidthGranularity;
+    if (!P.wide_lines)
+        rt_log("vk_pipeline: lines are drawn 1 pixel wide whatever width the game sets (%s)",
+               f2.features.wideLines ? "NX2NAVI_LINE_WIDTH=0" : "this device has no wide lines");
 #define PROC(field, name) (P.field = (void *)vk_dpa(c->device, name))
     PROC(push, "vkCmdPushDescriptorSetKHR");
     // Descriptor update templates (core 1.1; the push variant comes with VK_KHR_push_descriptor on 1.1): the driver
@@ -2206,6 +2217,14 @@ int vk_pool_marks_enabled(void) {
 // its depth, sample mask or stencil reference, or already writes memory does not, as early tests would change what it
 // does. The caller passes early_ok only for a pipeline without alpha to coverage, which also drops samples after the
 // shader (ensure_init keeps alpha to coverage out of the dynamic state while marks are on, so a pipeline knows).
+// A fragment shader's marks are stored where it ends, not where it samples. A store between a sample's coordinates and
+// the sample takes the quad's helper lanes out of the code in between on AMD's driver for Polaris: their coordinates
+// stayed stale, the derivatives at a triangle's edge were garbage, and edge pixels came out dark (the lines along the
+// paths' triangles since 0.7.0). Each access only notes its slot in a Private variable (a register); before each
+// return of the entry function, and before a kill, terminate or demote anywhere, every variable is stored to its slot,
+// a variable no access set going to the spare slot past the pool (vk_exec_draw.c pool_marks_make). An access in a loop
+// or outside the entry function can run more than once with other slots: it notes them in a ring of RING Private
+// variables, so a loop's last RING slots are all marked.
 // *status: 1 marked, 0 no pool texture access to mark, -1 one that could not be marked (*why says what stopped it).
 // NULL unless marked.
 static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, uint64_t *out_n, int *status,
@@ -2216,7 +2235,10 @@ static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, ui
            OP_EXECUTION_MODE = 16, OP_EXECUTION_MODE_ID = 331, OP_IMAGE_WRITE = 99, OP_ATOMIC_FIRST = 227,
            OP_ATOMIC_LAST = 242, OP_KILL = 252, OP_TERMINATE_INVOCATION = 4416, OP_DEMOTE_TO_HELPER = 5380,
            EM_EARLY_FRAGMENT_TESTS = 9, BI_SAMPLE_MASK = 20, BI_FRAG_DEPTH = 22, BI_FRAG_STENCIL_REF = 5014,
-           SC_STORAGE_BUFFER = 12, DEC_BLOCK = 2, DEC_ARRAY_STRIDE = 6, DEC_OFFSET_ = 35 };
+           SC_STORAGE_BUFFER = 12, DEC_BLOCK = 2, DEC_ARRAY_STRIDE = 6, DEC_OFFSET_ = 35, OP_TYPE_BOOL = 20,
+           OP_LOAD_ = 61, OP_BITCAST = 124, OP_SELECT_ = 169, OP_INOT_EQUAL = 171, OP_LOOP_MERGE = 246, OP_LABEL_ = 248,
+           OP_RETURN = 253, OP_RETURN_VALUE = 254, SC_PRIVATE = 6, LOOP_DEPTH = 64, OP_TYPE_ARRAY_ = 28, OP_IADD = 128,
+           OP_BITWISE_AND = 199, OP_ULESS_THAN = 176, OP_BRANCH = 249, OP_BRANCH_CONDITIONAL = 250, OP_PHI = 245 };
     *status = 0, *why = NULL;
     if (n < 5) return NULL;
     uint32_t bound = w[3];
@@ -2225,11 +2247,19 @@ static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, ui
     uint8_t *set2 = calloc(bound, 1);
     if (!bind || !set2) return free(bind), free(set2), *status = -1, *why = "no memory", NULL;
     uint64_t ann_end = 0, fn_start = 0, em_end = 0;   // em_end: past the entry points and execution modes
-    uint32_t uint_t = 0, c0 = 0, c1 = 0, ptr_u = 0, fs_entry = 0;
+    uint32_t uint_t = 0, c0 = 0, c1 = 0, ptr_u = 0, fs_entry = 0, int_t = 0, bool_t = 0;
     int vertex_stage = 0, fragment_stage = 0, entries = 0, early = early_ok;
+    uint32_t *rtype = calloc(bound, sizeof *rtype);   // per id: its result type, where the defer path needs it
+    uint8_t *is_type = calloc(bound, 1);
+    if (!rtype || !is_type)
+        return free(bind), free(set2), free(rtype), free(is_type), *status = -1, *why = "no memory", NULL;
+#define POOL_MARK_FREE() (free(bind), free(set2), free(rtype), free(is_type), free(site_def))
+    // per site: 0 stored in place; else deferred, bit 1 the index is signed (a bitcast), bit 2 a ring (in a loop or
+    // outside the entry function)
+    uint8_t *site_def = NULL;
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
-        if (!l || i + l > n) return free(bind), free(set2), *status = -1, *why = "an instruction past the module's end", NULL;
+        if (!l || i + l > n) return POOL_MARK_FREE(), *status = -1, *why = "an instruction past the module's end", NULL;
         if (op == SPV_OP_FUNCTION) { fn_start = i; break; }
         if (op == SPV_OP_ENTRY_POINT || op == OP_EXECUTION_MODE || op == OP_EXECUTION_MODE_ID) em_end = i + l;
         if (op == SPV_OP_ENTRY_POINT && l >= 3) {
@@ -2248,6 +2278,10 @@ static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, ui
             early = 0;   // the guest's own storage buffers: its stores would change under early tests
         } else if (op == SPV_OP_TYPE_INT && l == 4 && w[i + 2] == 32 && w[i + 3] == 0) {
             uint_t = w[i + 1];
+        } else if (op == SPV_OP_TYPE_INT && l == 4 && w[i + 2] == 32 && w[i + 3] == 1) {
+            int_t = w[i + 1];
+        } else if (op == OP_TYPE_BOOL && l == 2) {
+            bool_t = w[i + 1];
         } else if (op == SPV_OP_CONSTANT && l == 4 && uint_t && w[i + 1] == uint_t) {
             if (w[i + 3] == 0 && !c0) c0 = w[i + 2];
             if (w[i + 3] == 1 && !c1) c1 = w[i + 2];
@@ -2257,50 +2291,95 @@ static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, ui
         if (op == SPV_OP_DECORATE || op == OP_MEMBER_DECORATE_ || op == OP_DECORATION_GROUP || op == OP_GROUP_DECORATE ||
             op == OP_GROUP_MEMBER_DECORATE || op == OP_DECORATE_ID || op == OP_DECORATE_STRING || op == OP_MEMBER_DECORATE_STRING)
             ann_end = i + l;
+        if (op >= 19 && op <= 39 && l >= 2 && w[i + 1] < bound) is_type[w[i + 1]] = 1;   // OpTypeVoid .. OpTypeForwardPointer
+        else if (op == SPV_OP_CONSTANT && l >= 4 && w[i + 2] < bound) rtype[w[i + 2]] = w[i + 1];
         i += l;
     }
     // pool texture variables: set 2, a binding below VK_POOL_KINDS (spirv_pool_rebind); one already at the marks
     // binding means the module was marked before
-    uint64_t sites = 0;
+    enum { RING = 8 };
+    uint64_t sites = 0, deferred = 0, rings = 0, exits = 0;
     int marked = 0;
     for (uint32_t id = 0; id < bound; id++)
         if (set2[id] && bind[id] == VK_POOL_MARK_BINDING + 1) marked = 1;
+    site_def = fn_start && !marked ? calloc((n - fn_start) / 5 + 1, 1) : NULL;   // an access chain is 5 words or more
+    if (fn_start && !marked && !site_def) return POOL_MARK_FREE(), *status = -1, *why = "no memory", NULL;
+    uint32_t loops[LOOP_DEPTH], fn = 0;
+    int depth = 0;
     for (uint64_t i = fn_start; fn_start && !marked && i < n;) {
         uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
         if (!l || i + l > n) break;
+        if (l >= 3 && w[i + 1] < bound && is_type[w[i + 1]] && w[i + 2] < bound) rtype[w[i + 2]] = w[i + 1];
+        if (op == SPV_OP_FUNCTION && l >= 3) fn = w[i + 2], depth = 0;
+        else if (op == OP_LOOP_MERGE && l >= 3) depth < LOOP_DEPTH ? (void)(loops[depth++] = w[i + 1]) : (void)depth++;
+        else if (op == OP_LABEL_ && l >= 2 && depth > 0 && depth <= LOOP_DEPTH && loops[depth - 1] == w[i + 1]) depth--;
         if ((op == OP_ACCESS_CHAIN_ || op == OP_IN_BOUNDS_ACCESS_CHAIN) && l >= 5 && w[i + 3] < bound && set2[w[i + 3]] &&
-            bind[w[i + 3]] && bind[w[i + 3]] - 1 < VK_POOL_KINDS)
+            bind[w[i + 3]] && bind[w[i + 3]] - 1 < VK_POOL_KINDS) {
+            uint32_t ix = w[i + 4], t = ix < bound ? rtype[ix] : 0;
+            if (fragment_stage && entries == 1 && fs_entry && t && (t == uint_t || t == int_t)) {
+                int ring = fn != fs_entry || depth;
+                site_def[sites] = (uint8_t)(1 | (t == int_t ? 2 : 0) | (ring ? 4 : 0));
+                ring ? rings++ : deferred++;
+            }
             sites++;
-        else if (op == OP_KILL || op == OP_TERMINATE_INVOCATION || op == OP_DEMOTE_TO_HELPER || op == OP_IMAGE_WRITE ||
-                 (op >= OP_ATOMIC_FIRST && op <= OP_ATOMIC_LAST))
+        } else if (op == OP_KILL || op == OP_TERMINATE_INVOCATION || op == OP_DEMOTE_TO_HELPER || op == OP_IMAGE_WRITE ||
+                   (op >= OP_ATOMIC_FIRST && op <= OP_ATOMIC_LAST))
             early = 0;
+        if (op == OP_KILL || op == OP_TERMINATE_INVOCATION || op == OP_DEMOTE_TO_HELPER ||
+            (fn == fs_entry && (op == OP_RETURN || op == OP_RETURN_VALUE)))
+            exits++;
         i += l;
     }
-    if (marked || !sites) return free(bind), free(set2), NULL;
+    if (marked || !sites) return POOL_MARK_FREE(), NULL;
+    uint64_t stores = deferred + rings;   // what each way out stores: a variable, or a ring's entries in a loop
+    if (stores && (!exits || exits * (deferred + 3 * rings) > 8192))   // no way out to store at, or code that would grow
+        memset(site_def, 0, sites), deferred = rings = stores = 0;           // too much
     *why = w[1] < 0x00010300 || w[1] > 0x00010600 ? "a SPIR-V version before 1.3 or after 1.6"
          : !ann_end || !fn_start              ? "no decorations or no function"
          : vertex_stage && !marks_vs_ok       ? "the GPU allows no stores in vertex-pipeline shaders"
          : fragment_stage && !marks_fs_ok     ? "the GPU allows no stores in fragment shaders"
                                               : NULL;
-    if (*why) return free(bind), free(set2), *status = -1, NULL;
+    if (*why) return POOL_MARK_FREE(), *status = -1, NULL;
     early = early && fragment_stage && entries == 1 && em_end && em_end < ann_end;
     // From SPIR-V 1.4 on an entry point lists every global variable its functions use, not only the inputs and outputs
     // (the translator's mesh shaders are 1.4): each entry point gets the marks variable, a word more.
     int iface = w[1] >= 0x00010400;
-    // the mode, a word per entry point, decorations, at most 30 words of new types and the variable, 9 a site
-    uint64_t on = n + 3 + (uint64_t)entries + 20 + 30 + 9 * sites;
+    // the mode, a word per entry point, decorations, at most 30 words of new types and the variable, 9 a site; deferred:
+    // a word per entry point and variable, 80 words of types and constants, then per site its variables and the store of
+    // its slot (ring: 10 + 29), and per way out 29 words a variable and 8 * 29 a ring (its loop is 83)
+    uint64_t on = n + 3 + (uint64_t)entries * (1 + deferred + 2 * rings) + 20 + 30 + 9 * sites + 80 + deferred * 12 +
+                  rings * 40 + (deferred * 29 + rings * RING * 29) * exits;
     uint32_t *o = malloc(on * 4);
-    if (!o) return free(bind), free(set2), *status = -1, *why = "no memory", NULL;
+    if (!o) return POOL_MARK_FREE(), *status = -1, *why = "no memory", NULL;
     uint32_t next = bound;
     uint32_t new_uint = uint_t ? 0 : (uint_t = next++), new_c0 = c0 ? 0 : (c0 = next++), new_c1 = c1 ? 0 : (c1 = next++);
     uint32_t rta = next++, st = next++, ptr_st = next++, var = next++, new_ptr_u = ptr_u ? 0 : (ptr_u = next++);
+    // deferred: the types, constants and variables (pv0: one per site; ra0, rc0: a ring and its count per ring site)
+    uint32_t new_bool = 0, ptr_pv = 0, c_none = 0, c_spare = 0, pv0 = 0, ring_t = 0, ptr_ring = 0, ring_none = 0,
+             cr[RING] = {0}, c_ring = 0, ra0 = 0, rc0 = 0;
+    if (stores) {
+        new_bool = bool_t ? 0 : (bool_t = next++);
+        ptr_pv = next++, c_none = next++, c_spare = next++, pv0 = next, next += (uint32_t)deferred;
+        if (rings) {
+            ring_t = next++, ptr_ring = next++, ring_none = next++, c_ring = next++;
+            for (int j = 0; j < RING; j++) cr[j] = next++;
+            ra0 = next, next += (uint32_t)rings, rc0 = next, next += (uint32_t)rings;
+        }
+    }
     uint64_t p = 5;
     memcpy(o, w, 5 * 4);
     for (uint64_t i = 5; i < ann_end;) {   // the header up to the annotations' end: entry points widened, the mode added
         uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
         if (early && i == em_end) o[p++] = 3u << 16 | OP_EXECUTION_MODE, o[p++] = fs_entry, o[p++] = EM_EARLY_FRAGMENT_TESTS;
         memcpy(o + p, w + i, l * 4);
-        if (iface && op == SPV_OP_ENTRY_POINT && l >= 3) o[p] = (l + 1) << 16 | op, o[p + l] = var, p++;
+        if (iface && op == SPV_OP_ENTRY_POINT && l >= 3) {
+            uint32_t nv = 0, *at = o + p + l + 1;   // the marks buffer, then pv0.., ra0.. and rc0..
+            o[p] = (uint32_t)(l + 1 + deferred + 2 * rings) << 16 | op, o[p + l] = var, p++;
+            for (uint32_t k = 0; k < deferred; k++) at[nv++] = pv0 + k;
+            for (uint32_t k = 0; k < rings; k++) at[nv++] = ra0 + k;
+            for (uint32_t k = 0; k < rings; k++) at[nv++] = rc0 + k;
+            p += nv;
+        }
         p += l;
         i += l;
     }
@@ -2318,19 +2397,109 @@ static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, ui
     o[p++] = 4u << 16 | SPV_OP_TYPE_POINTER, o[p++] = ptr_st, o[p++] = SC_STORAGE_BUFFER, o[p++] = st;
     if (new_ptr_u) o[p++] = 4u << 16 | SPV_OP_TYPE_POINTER, o[p++] = ptr_u, o[p++] = SC_STORAGE_BUFFER, o[p++] = uint_t;
     o[p++] = 4u << 16 | SPV_OP_VARIABLE, o[p++] = ptr_st, o[p++] = var, o[p++] = SC_STORAGE_BUFFER;
+    if (stores) {
+        if (new_bool) o[p++] = 2u << 16 | OP_TYPE_BOOL, o[p++] = bool_t;
+        o[p++] = 4u << 16 | SPV_OP_TYPE_POINTER, o[p++] = ptr_pv, o[p++] = SC_PRIVATE, o[p++] = uint_t;
+        o[p++] = 4u << 16 | SPV_OP_CONSTANT, o[p++] = uint_t, o[p++] = c_none, o[p++] = 0xffffffffu;
+        o[p++] = 4u << 16 | SPV_OP_CONSTANT, o[p++] = uint_t, o[p++] = c_spare, o[p++] = VK_POOL_TEX;
+        if (rings) {
+            for (int j = 0; j < RING; j++) o[p++] = 4u << 16 | SPV_OP_CONSTANT, o[p++] = uint_t, o[p++] = cr[j], o[p++] = (uint32_t)j;
+            o[p++] = 4u << 16 | SPV_OP_CONSTANT, o[p++] = uint_t, o[p++] = c_ring, o[p++] = RING;
+            o[p++] = 4u << 16 | OP_TYPE_ARRAY_, o[p++] = ring_t, o[p++] = uint_t, o[p++] = c_ring;
+            o[p++] = 4u << 16 | SPV_OP_TYPE_POINTER, o[p++] = ptr_ring, o[p++] = SC_PRIVATE, o[p++] = ring_t;
+            o[p++] = (3u + RING) << 16 | SPV_OP_CONSTANT_COMPOSITE, o[p++] = ring_t, o[p++] = ring_none;
+            for (int j = 0; j < RING; j++) o[p++] = c_none;
+        }
+        for (uint32_t k = 0; k < deferred; k++)
+            o[p++] = 5u << 16 | SPV_OP_VARIABLE, o[p++] = ptr_pv, o[p++] = pv0 + k, o[p++] = SC_PRIVATE, o[p++] = c_none;
+        for (uint32_t k = 0; k < rings; k++)
+            o[p++] = 5u << 16 | SPV_OP_VARIABLE, o[p++] = ptr_ring, o[p++] = ra0 + k, o[p++] = SC_PRIVATE, o[p++] = ring_none;
+        for (uint32_t k = 0; k < rings; k++)
+            o[p++] = 5u << 16 | SPV_OP_VARIABLE, o[p++] = ptr_pv, o[p++] = rc0 + k, o[p++] = SC_PRIVATE, o[p++] = c0;
+    }
+    uint64_t site = 0;
+    uint32_t k_def = 0, k_ring = 0, cur = 0;   // cur: the label of the block being copied
+    fn = 0;
     for (uint64_t i = fn_start; i < n;) {
         uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
+        if (op == SPV_OP_FUNCTION && l >= 3) fn = w[i + 2];
+        if (op == OP_LABEL_ && l >= 2) cur = w[i + 1];
+        if (stores && (op == OP_KILL || op == OP_TERMINATE_INVOCATION || op == OP_DEMOTE_TO_HELPER ||
+                       (fn == fs_entry && (op == OP_RETURN || op == OP_RETURN_VALUE)))) {
+            // marks[the slot, or the spare when none was noted] = 1
+#define POOL_MARK_STORE(from)                                                                                         \
+    do {                                                                                                              \
+        uint32_t v_ = next++, ok_ = next++, ix_ = next++, at_ = next++;                                              \
+        o[p++] = 4u << 16 | OP_LOAD_, o[p++] = uint_t, o[p++] = v_, o[p++] = (from);                                 \
+        o[p++] = 5u << 16 | OP_INOT_EQUAL, o[p++] = bool_t, o[p++] = ok_, o[p++] = v_, o[p++] = c_none;              \
+        o[p++] = 6u << 16 | OP_SELECT_, o[p++] = uint_t, o[p++] = ix_, o[p++] = ok_, o[p++] = v_, o[p++] = c_spare;  \
+        o[p++] = 6u << 16 | OP_ACCESS_CHAIN_, o[p++] = ptr_u, o[p++] = at_, o[p++] = var, o[p++] = c0, o[p++] = ix_; \
+        o[p++] = 3u << 16 | OP_STORE_, o[p++] = at_, o[p++] = c1;                                                    \
+    } while (0)
+            for (uint32_t k = 0; k < deferred; k++) POOL_MARK_STORE(pv0 + k);
+            for (uint32_t r = 0; r < rings; r++) {
+                if (op == OP_DEMOTE_TO_HELPER) {   // not the block's end: every entry, without a loop
+                    for (int j = 0; j < RING; j++) {
+                        uint32_t from = next++;
+                        o[p++] = 5u << 16 | OP_ACCESS_CHAIN_, o[p++] = ptr_pv, o[p++] = from, o[p++] = ra0 + r, o[p++] = cr[j];
+                        POOL_MARK_STORE(from);
+                    }
+                    continue;
+                }
+                // the block ends here (a return, kill or terminate), so it can end in a loop over the entries noted:
+                // for (j = 0; j < min(count, RING); j++) mark ring[j]
+                uint32_t cnt = next++, lt = next++, lim = next++, hd = next++, j = next++, mg = next++, ct = next++,
+                         cond = next++, body = next++, from = next++, jn = next++;
+                o[p++] = 4u << 16 | OP_LOAD_, o[p++] = uint_t, o[p++] = cnt, o[p++] = rc0 + r;
+                o[p++] = 5u << 16 | OP_ULESS_THAN, o[p++] = bool_t, o[p++] = lt, o[p++] = cnt, o[p++] = c_ring;
+                o[p++] = 6u << 16 | OP_SELECT_, o[p++] = uint_t, o[p++] = lim, o[p++] = lt, o[p++] = cnt, o[p++] = c_ring;
+                o[p++] = 2u << 16 | OP_BRANCH, o[p++] = hd;
+                o[p++] = 2u << 16 | OP_LABEL_, o[p++] = hd;
+                o[p++] = 7u << 16 | OP_PHI, o[p++] = uint_t, o[p++] = j, o[p++] = c0, o[p++] = cur, o[p++] = jn, o[p++] = ct;
+                o[p++] = 5u << 16 | OP_ULESS_THAN, o[p++] = bool_t, o[p++] = cond, o[p++] = j, o[p++] = lim;
+                o[p++] = 4u << 16 | OP_LOOP_MERGE, o[p++] = mg, o[p++] = ct, o[p++] = 0;
+                o[p++] = 4u << 16 | OP_BRANCH_CONDITIONAL, o[p++] = cond, o[p++] = body, o[p++] = mg;
+                o[p++] = 2u << 16 | OP_LABEL_, o[p++] = body;
+                o[p++] = 5u << 16 | OP_ACCESS_CHAIN_, o[p++] = ptr_pv, o[p++] = from, o[p++] = ra0 + r, o[p++] = j;
+                POOL_MARK_STORE(from);
+                o[p++] = 2u << 16 | OP_BRANCH, o[p++] = ct;
+                o[p++] = 2u << 16 | OP_LABEL_, o[p++] = ct;
+                o[p++] = 5u << 16 | OP_IADD, o[p++] = uint_t, o[p++] = jn, o[p++] = j, o[p++] = c1;
+                o[p++] = 2u << 16 | OP_BRANCH, o[p++] = hd;
+                o[p++] = 2u << 16 | OP_LABEL_, o[p++] = mg;
+                cur = mg;
+            }
+#undef POOL_MARK_STORE
+        }
         memcpy(o + p, w + i, l * 4), p += l;
         if ((op == OP_ACCESS_CHAIN_ || op == OP_IN_BOUNDS_ACCESS_CHAIN) && l >= 5 && w[i + 3] < bound && set2[w[i + 3]] &&
             bind[w[i + 3]] && bind[w[i + 3]] - 1 < VK_POOL_KINDS) {
-            uint32_t at = next++;   // marks[slot] = 1, slot being the pool index of this access
-            o[p++] = 6u << 16 | OP_ACCESS_CHAIN_, o[p++] = ptr_u, o[p++] = at, o[p++] = var, o[p++] = c0, o[p++] = w[i + 4];
-            o[p++] = 3u << 16 | OP_STORE_, o[p++] = at, o[p++] = c1;
+            uint8_t d = site_def[site++];
+            if (d) {   // the slot noted for the stores at the end
+                uint32_t ix = w[i + 4];
+                if (d & 2) o[p++] = 4u << 16 | OP_BITCAST, o[p++] = uint_t, o[p++] = next, o[p++] = ix, ix = next++;
+                if (d & 4) {   // ring[count % RING] = slot, count + 1
+                    uint32_t ra = ra0 + k_ring, rc = rc0 + k_ring++, cnt = next++, j = next++, at = next++, inc = next++;
+                    o[p++] = 4u << 16 | OP_LOAD_, o[p++] = uint_t, o[p++] = cnt, o[p++] = rc;
+                    o[p++] = 5u << 16 | OP_BITWISE_AND, o[p++] = uint_t, o[p++] = j, o[p++] = cnt, o[p++] = cr[RING - 1];
+                    o[p++] = 5u << 16 | OP_ACCESS_CHAIN_, o[p++] = ptr_pv, o[p++] = at, o[p++] = ra, o[p++] = j;
+                    o[p++] = 3u << 16 | OP_STORE_, o[p++] = at, o[p++] = ix;
+                    o[p++] = 5u << 16 | OP_IADD, o[p++] = uint_t, o[p++] = inc, o[p++] = cnt, o[p++] = c1;
+                    o[p++] = 3u << 16 | OP_STORE_, o[p++] = rc, o[p++] = inc;
+                } else {
+                    o[p++] = 3u << 16 | OP_STORE_, o[p++] = pv0 + k_def++, o[p++] = ix;
+                }
+            } else {
+                uint32_t at = next++;   // marks[slot] = 1, slot being the pool index of this access
+                o[p++] = 6u << 16 | OP_ACCESS_CHAIN_, o[p++] = ptr_u, o[p++] = at, o[p++] = var, o[p++] = c0, o[p++] = w[i + 4];
+                o[p++] = 3u << 16 | OP_STORE_, o[p++] = at, o[p++] = c1;
+            }
         }
         i += l;
     }
     o[3] = next;
-    free(bind), free(set2);
+    POOL_MARK_FREE();
+#undef POOL_MARK_FREE
     *out_n = p;
     *status = 1;
     return o;
@@ -2492,9 +2661,9 @@ static const char *origin_name(const GfxShader *s) {
 // The shaders of the pipeline this thread builds, for the crash notes (platform.h plat_crash_context): the first 8
 // bytes of each cache key, as gfx_shader.c names its cache files.
 static void crash_note(const char *what, const GfxShader *a, const GfxShader *b, const GfxShader *c) {
-    static __thread char buf[160];
+    static __thread char buf[320];
     char *o = buf;
-    o += snprintf(o, 40, "building %s", what);
+    o += snprintf(o, 160, "building %s", what);
     const GfxShader *sh[3] = {a, b, c};
     for (int i = 0; i < 3; i++)
         if (sh[i]) {
@@ -2588,8 +2757,8 @@ static int layout_covers(const VkPipeState *s, const Layout *l, uint32_t fs_off,
 // layouts hold the compute stage only). VK_NULL_HANDLE when templates are off, for an empty set, for a push set
 // without vkCmdPushDescriptorSetWithTemplateKHR or when creation fails: the replay then writes the set with write
 // structs.
-static VkDescriptorUpdateTemplate make_tpl(const VkDescriptorSetLayoutBinding *b, uint32_t n, VkDescriptorSetLayout sl,
-                                           int push, VkPipelineLayout pl, uint32_t set) {
+static VkDescriptorUpdateTemplate make_tpl_bp(const VkDescriptorSetLayoutBinding *b, uint32_t n, VkDescriptorSetLayout sl,
+                                              int push, VkPipelineLayout pl, uint32_t set, int bp) {
     if (!P.tpl || !n || (push && !P.tpl_push)) return VK_NULL_HANDLE;
     VkDescriptorUpdateTemplateEntry e[MAX_BINDINGS];
     size_t off = 0;
@@ -2604,7 +2773,8 @@ static VkDescriptorUpdateTemplate make_tpl(const VkDescriptorSetLayoutBinding *b
         .pDescriptorUpdateEntries = e,
         .templateType = push ? VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR : VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET,
         .descriptorSetLayout = sl,
-        .pipelineBindPoint = stages & VK_SHADER_STAGE_COMPUTE_BIT ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .pipelineBindPoint = bp >= 0 ? (VkPipelineBindPoint)bp
+                             : stages & VK_SHADER_STAGE_COMPUTE_BIT ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
         .pipelineLayout = pl, .set = set};
     VkDescriptorUpdateTemplate t;
     if (P.tpl_create(P.device, &ci, NULL, &t) != VK_SUCCESS) {
@@ -2612,6 +2782,10 @@ static VkDescriptorUpdateTemplate make_tpl(const VkDescriptorSetLayoutBinding *b
         return VK_NULL_HANDLE;
     }
     return t;
+}
+static VkDescriptorUpdateTemplate make_tpl(const VkDescriptorSetLayoutBinding *b, uint32_t n, VkDescriptorSetLayout sl,
+                                           int push, VkPipelineLayout pl, uint32_t set) {
+    return make_tpl_bp(b, n, sl, push, pl, set, -1);
 }
 
 // Finds or creates the layout of a binding list (sorted here); NULL on failure. Caller holds P.lock.
@@ -2665,6 +2839,158 @@ static Layout *layout_get(Bindings *B) {
     P.stats.layouts++;
     P.stats.push_layouts += (uint64_t)l->push;
     return l;
+}
+
+// NX2NAVI_MESH_EMULATION (GPUs without VK_EXT_mesh_shader): the layout of an emulated mesh pipeline. The task and
+// mesh stages' bindings are visible to the compute stage (they run as compute pipelines of this layout), the
+// fragment stage's stay; push constants (MESH_EMU_PC_BYTES) for the compute stages and the generated vertex shader;
+// set 0 gets a template per bind point. Caller holds P.lock.
+static int mesh_emu_on(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("MESH_EMULATION", "0");
+    return on;
+}
+
+static Layout *layout_get_emu(Bindings *B) {
+    for (uint32_t i = 0; i < B->n; i++) {
+        VkShaderStageFlags f = B->b[i].stageFlags;
+        if (f & (VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT))
+            f = (f & ~(VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT)) | VK_SHADER_STAGE_COMPUTE_BIT;
+        B->b[i].stageFlags = f;
+        B->pb[i].stages = f;
+    }
+    uint64_t h = fnv(FNV0, "mesh-emu", 8);
+    int64_t total = bindings_sort(B, &h);
+    if (total < 0) return NULL;
+    Layout **head = &layouts[h % LAYOUT_BUCKETS];
+    for (Layout *l = *head; l; l = l->next)
+        if (l->hash == h && l->emu && l->n == B->n && !memcmp(l->b, B->b, B->n * sizeof *B->b)) return l;
+    Layout *l = calloc(1, sizeof *l + B->n * sizeof *B->b);
+    if (!l) return NULL;
+    l->hash = h, l->n = B->n, l->emu = 1;
+    memcpy(l->b, B->b, B->n * sizeof *B->b);
+    l->push = total <= (int64_t)P.max_push;
+    VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                          .flags = l->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
+                                          .bindingCount = l->n, .pBindings = l->b};
+    if (vkCreateDescriptorSetLayout(P.device, &si, NULL, &l->set) != VK_SUCCESS) {
+        free(l);
+        return NULL;
+    }
+    VkDescriptorSetLayout sets3[3] = {l->set, vk_empty_set_layout(), vk_pool_set_layout()};
+    VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT, 0, MESH_EMU_PC_BYTES};
+    VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 3,
+                                     .pSetLayouts = sets3, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
+    if (vkCreatePipelineLayout(P.device, &pi, NULL, &l->layout) != VK_SUCCESS) {
+        vkDestroyDescriptorSetLayout(P.device, l->set, NULL);
+        free(l);
+        return NULL;
+    }
+    l->tpl[0] = make_tpl_bp(l->b, l->n, l->set, l->push, l->layout, 0, VK_PIPELINE_BIND_POINT_GRAPHICS);
+    l->tpl_c = make_tpl_bp(l->b, l->n, l->set, l->push, l->layout, 0, VK_PIPELINE_BIND_POINT_COMPUTE);
+    l->next = *head;
+    *head = l;
+    P.stats.layouts++;
+    return l;
+}
+
+// The compute pipelines of an emulated mesh pipeline, per (mesh, task, layout): made by the pipeline's build
+// (create_graphics, any thread) and found by its draws. ok 0: the stages could not be converted or built.
+typedef struct MeshEmuEnt {
+    struct MeshEmuEnt *next;
+    const GfxShader *ms, *ts;
+    VkPipelineLayout layout;
+    int ok;
+    VkPipeline mesh, task;
+    MeshEmuInfo mi, ti;
+} MeshEmuEnt;
+// Each draw of an emulated mesh pipeline looks its entry up (vk_pipeline_mesh_emu), so the lookup takes no lock: an
+// entry is complete before it is published at its bucket's head (release) and is never removed. emu_lock only orders
+// the publishing. The build (two compute pipelines, up to seconds each in the driver on a first run) is done outside
+// it: held across the build, as before, it stopped every draw of the replay that looked up any entry meanwhile, 2.5 s
+// of the replay thread's samples in a first 0.8.0 run in Kokiri Forest on an RX 580 (2026-11-11).
+#define EMU_BUCKETS 256
+static MeshEmuEnt *emu_ents[EMU_BUCKETS];
+static PlatMutex emu_lock = PLAT_MUTEX_INIT;
+
+static uint32_t emu_bucket(const GfxShader *ms, const GfxShader *ts, VkPipelineLayout layout) {
+    uint64_t h = (uint64_t)(uintptr_t)ms * 0x9e3779b97f4a7c15ull ^ (uint64_t)(uintptr_t)ts * 0xc2b2ae3d27d4eb4full ^
+                 (uint64_t)(uintptr_t)layout * 0x165667b19e3779f9ull;
+    return (uint32_t)(h >> 40) % EMU_BUCKETS;
+}
+
+static MeshEmuEnt *emu_find(MeshEmuEnt *e, const GfxShader *ms, const GfxShader *ts, VkPipelineLayout layout) {
+    while (e && !(e->ms == ms && e->ts == ts && e->layout == layout)) e = __atomic_load_n(&e->next, __ATOMIC_ACQUIRE);
+    return e;
+}
+
+static VkPipeline emu_compute(const uint32_t *w, size_t n, VkPipelineLayout layout) {
+    VkShaderModule m = make_module(w, n, 0);
+    if (!m) return VK_NULL_HANDLE;
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
+                                      .layout = layout};
+    VkPipeline p = VK_NULL_HANDLE;
+    if (vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+    vkDestroyShaderModule(P.device, m, NULL);
+    return p;
+}
+
+static const MeshEmuEnt *emu_get(const GfxShader *ms, const GfxShader *ts, VkPipelineLayout layout, uint32_t toff, int create) {
+    MeshEmuEnt **head = &emu_ents[emu_bucket(ms, ts, layout)];
+    MeshEmuEnt *e = emu_find(__atomic_load_n(head, __ATOMIC_ACQUIRE), ms, ts, layout);
+    if (e || !create) return e;
+    e = calloc(1, sizeof *e);
+    if (!e) return NULL;
+    e->ms = ms, e->ts = ts, e->layout = layout;
+    const char *why = NULL;
+    uint64_t n = 0;
+    size_t cn = 0;
+    const uint32_t *w = gfx_shader_spirv(ms, &n);
+    uint32_t *c = w ? mesh_emu_compute(w, (size_t)n, &e->mi, &cn, &why) : NULL;
+    if (c && (e->mesh = emu_compute(c, cn, layout))) e->ok = 1;
+    else if (!why) why = "the mesh stage's compute pipeline was not created";
+    free(c);
+    if (e->ok && e->mi.payload_words && !ts) e->ok = 0, why = "a mesh stage that reads a task payload without a task stage";
+    if (e->ok && ts) {
+        w = gfx_shader_spirv(ts, &n);
+        c = w ? mesh_emu_compute(w, (size_t)n, &e->ti, &cn, &why) : NULL;
+        uint32_t *r = c && toff ? spirv_rebind(c, cn, toff) : NULL;   // the task stage's bindings follow the fragment stage's
+        if (c && (e->task = emu_compute(r ? r : c, cn, layout))) {
+            if (e->ti.payload_words != e->mi.payload_words) e->ok = 0, why = "task and mesh payload sizes differ";
+        } else {
+            e->ok = 0;
+            if (!why) why = "the task stage's compute pipeline was not created";
+        }
+        free(r), free(c);
+    }
+    plat_mutex_lock(&emu_lock);
+    MeshEmuEnt *had = emu_find(*head, ms, ts, layout);   // another build of the same stages published first: keep that
+    if (!had) {
+        static int logged;
+        if (!e->ok && logged++ < 16) rt_log("vk_pipeline: mesh emulation: a mesh program is not emulated: %s", why ? why : "?");
+        e->next = *head;
+        __atomic_store_n(head, e, __ATOMIC_RELEASE);
+    }
+    plat_mutex_unlock(&emu_lock);
+    if (had) {
+        if (e->mesh) vkDestroyPipeline(P.device, e->mesh, NULL);
+        if (e->task) vkDestroyPipeline(P.device, e->task, NULL);
+        free(e);
+        return had;
+    }
+    return e;
+}
+
+int vk_pipeline_mesh_emu(const GfxShader *ms, const GfxShader *ts, VkPipelineLayout layout, VkPipeline *mesh,
+                         VkPipeline *task, MeshEmuInfo *mi) {
+    const MeshEmuEnt *e = emu_get(ms, ts, layout, 0, 0);
+    if (!e || !e->ok) return 0;
+    *mesh = e->mesh, *task = e->task;
+    *mi = e->mi;
+    if (ts) mi->max_mesh = e->ti.max_mesh;
+    return 1;
 }
 
 // Independent layouts (P.indep): the vertex stage's bindings in set 0, the fragment stage's in set 1 (empty without a
@@ -2793,6 +3119,7 @@ static Pipe *pipe_add(const void *key, size_t size, uint64_t h, VkPipeline pipel
     p->info.n_sets = l && l->set1 ? 2 : 1;
     p->info.pool = B ? B->pool : 0;
     if (l) p->info.tpl[0] = l->tpl[0], p->info.tpl[1] = l->tpl[1];
+    if (l && l->emu) p->info.emu = 1, p->info.emu_tpl_c = l->tpl_c;
     p->lay = l;
     Pipe **head = &pipes[h % PIPE_BUCKETS];
     p->next = *head;
@@ -2964,7 +3291,8 @@ static void gkey_fill(const VkPipeState *s, GKey *k) {
             o[3] = (uint8_t)blend_factor(b->src_a), o[4] = (uint8_t)blend_factor(b->dst_a), o[5] = (uint8_t)blend_op(b->eq_a);
         }
     }
-    if (is_mesh(s)) k->topo_class = 2;   // mesh draws: no vertex input, the mesh stage declares its primitives
+    // mesh draws: no vertex input, the mesh stage declares its primitives (emulated point meshes draw point lists)
+    if (is_mesh(s)) k->topo_class = s->prim == NVN_DRAW_PRIMITIVE_POINTS ? 0 : 2;
     if (!P.dyn_vi && !is_mesh(s)) {
         VtxInput v;
         vertex_input(s, &v);
@@ -3106,16 +3434,59 @@ static int water_mode(const VkPipeState *s, const GKey *k) {
     return mode == 1 && k->dsb ? 0 : mode;
 }
 
+// ---- line width (NX2NAVI_LINE_WIDTH, default 1; 0: every line 1 pixel wide, as before)
+// The game sets a width for its lines (nvnCommandBufferSetLineWidth, recorded as OP_BIND_STATE kind 7): 4.5 pixels
+// for two line draws a frame into a 144x144 R8 target, which were drawn 1 pixel wide. A pipeline of the line topology
+// class lists the width as dynamic state, in its whole build and in its pre-rasterization library (PrKey.lines), and
+// each draw of lines records the width the game set, held to the device's range. Pipelines of the other classes are
+// built as before, so their entries in the pipeline caches and the driver's stay the ones in use. A polygon mode that
+// draws triangles as lines keeps 1 pixel: the mode can be dynamic state, which no pipeline key tells apart.
+static int key_lines(const GKey *k) { return P.wide_lines && k->topo_class == 1; }
+
+void vk_pipeline_line_width(VkCommandBuffer cb, const VkPipeState *s, float width) {
+    if (!P.wide_lines || is_mesh(s) || topology_class(vk_pipeline_topology(s->prim)) != 1) return;
+    float w = width > 0 ? width : 1.0f;
+    if (P.line_gran > 0) w = P.line_w[0] + P.line_gran * (float)(int)((w - P.line_w[0]) / P.line_gran + 0.5f);
+    w = w < P.line_w[0] ? P.line_w[0] : w > P.line_w[1] ? P.line_w[1] : w;
+    static float logged;
+    if (w != 1.0f && w != logged) {   // one line for each width in a row: the game uses one or two
+        logged = w;
+        rt_log("vk_pipeline: lines drawn %g pixels wide (the game set %g; the device draws %g to %g in steps of %g)",
+               (double)w, (double)width, (double)P.line_w[0], (double)P.line_w[1], (double)P.line_gran);
+    }
+    vkCmdSetLineWidth(cb, w);
+}
+
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
     uint64_t vw, fw, vm_hash = 0, fm_hash = 0;   // the hashes: of the final modules, for the PIPE_FEEDBACK 2 line
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
     uint32_t *vpatched = NULL, *fpatched = NULL;
-    int mesh = is_mesh(s);
+    int mesh = is_mesh(s), emu = mesh && l->emu;
+    // the water pair's vertex edit is for a translated vertex stage: an emulated mesh draw's generated one has none
     int wmode = mesh || !l->set1 ? 0 : water_mode(s, k);   // the edited fragment modules are in their set 1 form
     uint64_t wn = 0;
     const uint32_t *vwater = water_pair_vertex(vcode, vw, wmode, &wn);
     if (vwater) vcode = vwater, vw = wn;
+    if (emu) {   // NX2NAVI_MESH_EMULATION: the task and mesh stages as compute pipelines, a generated vertex shader here
+        uint32_t toff = fs_off + (s->fs ? binding_span(s->fs) - 1 : 0);
+        const MeshEmuEnt *me = emu_get(s->vs, s->ts, l->layout, toff, 1);
+        if (!me || !me->ok) return VK_NULL_HANDLE;
+        GfxShaderIo fin[32];
+        uint8_t ty[32], cp[32];
+        uint32_t need = s->fs ? gfx_shader_inputs(s->fs, fin) : 0;
+        for (int i = 0; i < 32; i++) {
+            ty[i] = need >> i & 1 && !fin[i].packed && fin[i].type <= GFX_TYPE_UINT ? (uint8_t)fin[i].type : 0;
+            cp[i] = need >> i & 1 && !fin[i].packed && fin[i].comps ? (uint8_t)fin[i].comps : 4;
+        }
+        size_t vn = 0;
+        uint64_t fsw = 0;
+        const uint32_t *fcode0 = s->fs ? gfx_shader_spirv(s->fs, &fsw) : NULL;
+        vpatched = mesh_emu_vs(&me->mi, need, ty, cp, fcode0, (size_t)fsw, &vn);
+        if (!vpatched) return VK_NULL_HANDLE;
+        vcode = vpatched, vw = vn;
+        mesh = 0;   // a vertex pipeline from here on
+    }
     VkShaderModule tm = VK_NULL_HANDLE;
     if (mesh && s->ts) {   // the task stage's bindings follow the fragment stage's (pipe_miss)
         uint64_t tw;
@@ -3137,14 +3508,15 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     if (s->fs) {
         GfxShaderIo fin[32], vout[32];
-        // a mesh stage's outputs from its module (spirv_mesh_outputs): the translation reflects none
+        // a mesh stage's outputs from its module (spirv_mesh_outputs): the translation reflects none; an emulated one
+        // (mesh_emu) writes what the fragment stage reads
         int points = 0;
         uint32_t need = gfx_shader_inputs(s->fs, fin), missing = 0,
-                 have = mesh ? (vcode ? spirv_mesh_outputs(vcode, vw, &points) : ~0u) : gfx_shader_outputs(s->vs, vout);
+                 have = mesh ? (vcode ? spirv_mesh_outputs(vcode, vw, &points) : ~0u) : emu ? ~0u : gfx_shader_outputs(s->vs, vout);
         for (int i = 0; i < 32; i++) {
             if (!(need >> i & 1) || fin[i].packed) continue;
             if (!(have >> i & 1)) missing |= 1u << i;
-            else if (!mesh && vout[i].type != fin[i].type)
+            else if (!mesh && !emu && vout[i].type != fin[i].type)
                 LOG_ONCE("vk_pipeline: varying %d is type %d in the vertex stage, %d in the fragment stage", i, vout[i].type, fin[i].type);
         }
         if (missing && !l->set1 && !mesh) {
@@ -3193,7 +3565,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqv, rqf;
     uint64_t sw;
     const uint32_t *scode = gfx_shader_spirv(s->vs, &sw);   // vcode may be a patched copy that is freed by now
-    pin_subgroup32(&stages[0], &rqv, scode, sw);
+    if (!emu) pin_subgroup32(&stages[0], &rqv, scode, sw);
     if (s->fs) pin_subgroup32(&stages[1], &rqf, gfx_shader_spirv(s->fs, &sw), sw);
     VkVertexInputAttributeDescription va[32];
     VkVertexInputBindingDescription vb[17];
@@ -3244,6 +3616,11 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
                                            .dynamicStateCount = P.n_dyn, .pDynamicStates = P.dyn};
     VkDynamicState mdyn[sizeof P.dyn / sizeof P.dyn[0] + 1];
+    if (!mesh && key_lines(k)) {   // lines take the game's width per draw (vk_pipeline_line_width)
+        memcpy(mdyn, P.dyn, P.n_dyn * sizeof *mdyn);
+        mdyn[P.n_dyn] = VK_DYNAMIC_STATE_LINE_WIDTH;
+        dy.dynamicStateCount = P.n_dyn + 1, dy.pDynamicStates = mdyn;
+    }
     if (mesh) {   // a mesh pipeline must not list vertex input, topology or primitive restart as dynamic
         uint32_t n = 0;
         for (uint32_t i = 0; i < P.n_dyn; i++)
@@ -3331,7 +3708,9 @@ typedef struct Lib { struct Lib *next; uint64_t hash; VkPipeline pipe; uint32_t 
 static Lib *libs[LIB_BUCKETS];
 
 typedef struct { uint32_t kind, topo_class, attr_fmt[32], attr_off[32]; uint8_t attr_bind[32], rate[17], pad[3]; } ViKey;
-typedef struct { uint32_t kind, missing; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, water_projective; GfxShaderIo fin[32]; } PrKey;
+typedef struct { uint32_t kind, missing; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, water_projective;
+                 uint8_t lines;   // key_lines: the library lists the line width as dynamic state
+                 GfxShaderIo fin[32]; } PrKey;
 typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, water_projective; const GfxShader *fs; } FsKey;
 typedef struct { uint32_t kind; uint8_t n_color, samples, a2c, logic_op, blend_en, fbl, pad[2]; uint32_t color[8], depth, stencil, wmask;
                  uint8_t blend[8][6]; } FoKey;   // fbl: GKey.fbl, the feedback loop flags of the library (gpl_feedback)
@@ -3360,6 +3739,12 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
                                            .dynamicStateCount = P.n_dyn, .pDynamicStates = P.dyn};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
                                        .flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | noopt_flag(), .pDynamicState = &dy};
+    VkDynamicState ldyn[sizeof P.dyn / sizeof P.dyn[0] + 1];
+    if (kind == LIB_PR && ((const PrKey *)key)->lines) {   // the rasterization state is this library's: as create_graphics
+        memcpy(ldyn, P.dyn, P.n_dyn * sizeof *ldyn);
+        ldyn[P.n_dyn] = VK_DYNAMIC_STATE_LINE_WIDTH;
+        dy.dynamicStateCount = P.n_dyn + 1, dy.pDynamicStates = ldyn;
+    }
     VkShaderModule m = VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo st = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pName = "main"};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq;
@@ -3458,7 +3843,9 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
     VkPipelineCreationFeedbackCreateInfo fci;
     VkPipelineCreationFeedback fb;
     pi.pNext = fb_chain(&fci, &fb, pi.pNext);
-    crash_note("a pipeline library", s->vs, s->fs, NULL);
+    static const char *const kind_name[4] = {"a vertex input library", "a pre-rasterization library",
+                                             "a fragment shader library", "a fragment output library"};
+    crash_note(kind_name[kind], s->vs, s->fs, NULL);
     if (pipe_create(1, &pi, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
     plat_crash_context(NULL);
     if (pipe && (kind == LIB_PR || kind == LIB_FS)) fb_note(FB_LIBRARY, &fb);   // the shader libraries: the others compile nothing
@@ -3627,6 +4014,7 @@ static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, F
     memset(pk, 0, sizeof *pk);
     GfxShaderIo fin[32];
     pk->kind = LIB_PR, pk->vs = s->vs, pk->clamp = k->clamp, pk->poly_mode = k->poly_mode, pk->minus_w = k->minus_w;
+    pk->lines = (uint8_t)key_lines(k);
     pk->missing = vs_union_missing(s, fin);
     for (int i = 0; i < 32; i++)
         if (pk->missing >> i & 1) pk->fin[i] = fin[i];
@@ -3689,7 +4077,12 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
                                            .layout = l->layout};
         if (build) plat_mutex_unlock(&P.lock);
         uint64_t t1 = qpc();
-        crash_note("a library link", s->vs, s->fs, NULL);
+        char what[160];   // the parts that differ between links: a link that crashes the driver names its case
+        snprintf(what, sizeof what,
+                 "a library link (fragment shader %s, %u colour targets, depth format %u, stencil format %u, %u samples, "
+                 "vertex outputs added %#x)", s->fs ? "yes" : "none", k->n_color, k->depth, k->stencil, k->samples,
+                 pk.missing);
+        crash_note(what, s->vs, s->fs, NULL);
         if (vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
         plat_crash_context(NULL);
         double ms = ms_since(t1);   // the link alone: library builds are counted apart
@@ -4509,11 +4902,12 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
         // vertex pipelines). They go to the workers like the others: built here, each new one stopped the frame for its
         // whole compile (0.26-0.51 s in Kokiri Forest), and they are recorded for the boot prewarm (keys_note).
         uint32_t fspan = s->fs ? binding_span(s->fs) : 1;
-        if (!vk_ctx()->has_mesh_shader) why = "the GPU has no mesh shaders";
+        int emu = !vk_ctx()->has_mesh_shader && mesh_emu_on();
+        if (!vk_ctx()->has_mesh_shader && !emu) why = "the GPU has no mesh shaders (mesh_emulation = 1 emulates them)";
         else if ((s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) || (s->ts && gfx_shader_stage(s->ts) != GFX_STAGE_TS)) why = "stage mismatch";
         else if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1)) ||
                  (s->ts && !add_stage(&B, s->ts, span - 1 + fspan - 1))) why = "too many bindings";
-        else if (!(l = layout_get(&B))) why = "descriptor layout creation failed";
+        else if (!(l = emu ? layout_get_emu(&B) : layout_get(&B))) why = "descriptor layout creation failed";
     } else if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS)) why = "stage mismatch";
     else if (k->topo_class == 3) why = "patches need tessellation stages, which are not translated";
     else if (P.indep) {
@@ -4978,8 +5372,12 @@ static int prewarm_run(int offline) {
         VkPipeState s = r[i].s;
         s.vs = vs, s.fs = fs, s.ts = ts;
         // a mesh pipeline of the shared list (keys_open_seed) on a GPU without mesh shaders, which draws them through
-        // the mesh fallback: none to build, as the preparation skips it (seed_pipelines)
-        if (is_mesh(&s) && !vk_ctx()->has_mesh_shader) {
+        // the mesh fallback: none to build, as the preparation skips it (seed_pipelines). With the mesh emulation
+        // (NX2NAVI_MESH_EMULATION) it is a vertex pipeline and its compute stages (pipe_miss: layout_get_emu), built
+        // here like the others: left to the first draw, each took 113-830 ms on an RX 580 and the draws waiting for it
+        // were skipped (22 of the 48 pipelines missed entering Kokiri Forest, 0.9.1), frames held back or shown without
+        // them.
+        if (is_mesh(&s) && !vk_ctx()->has_mesh_shader && !mesh_emu_on()) {
             dropped++;
             continue;
         }

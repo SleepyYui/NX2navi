@@ -189,7 +189,8 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   into the large one at a start once it reached `pipeline_cache_play_mb`, and by every preparation; the stage
   libraries the library warm builds in play go to the driver's own cache alone (`runtime/vk_pipeline.c`, "the play
   cache", `cache_save`).
-- The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `vk_fsr.c` runs AMD FSR 1
+- The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `NX2NAVI_NATIVE_TENSOR=1`
+  runs the game's own network programs instead (`vk_exec_draw.c` `native_tensor`, off by default). `vk_fsr.c` runs AMD FSR 1
   (EASU, RCAS) on the present when the window is larger than the picture.
 - Anti-aliasing (`vk_aa.c`, `NX2NAVI_AA`): the game anti-aliases with its own SMAA, three compute passes after the bloom
   composite (edges, blending weights, composition into the scene target as square-rooted RGB9E5 words). `off`, `fxaa`

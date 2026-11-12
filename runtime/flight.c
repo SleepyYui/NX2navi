@@ -1,5 +1,5 @@
 // NX2NAVI_FLIGHT=1 flight recorder: a ring of the last NX2NAVI_FLIGHT_FRAMES (600) presents, one record each (interval,
-// render-thread blocked time per perf kind, event counts, the game's time step) and a 320x180 thumbnail each (gfx_present.c, blitted on the
+// render-thread blocked time per perf kind, event counts, the game's time step) and a 640x360 thumbnail each (gfx_present.c, blitted on the
 // GPU by the present thread). A dump goes to <dir>/<YYYYMMDD-HHMMSS>-f<frame>/: events.tsv (the texture events of its
 // frames, flight_tex), f<frame>.png per thumbnail and frames.tsv, written in that order by a background thread. Triggers: F8 while the game window has focus, a frame interval over
 // NX2NAVI_FLIGHT_SPIKE_MS (100; 0 off; at most one dump per 10 s), NX2NAVI_FLIGHT_AT=<frame>[,<frame>...] and
@@ -111,7 +111,7 @@ void flight_init(void) {
     if (!(tex_ring = calloc(TEX_RING, sizeof *tex_ring))) rt_log("flight: no memory for the texture events, none kept");
     flight_on = 1;
     rt_log("flight: on: last %d frames, %s; dump on F8, on a frame over %llu ms (one per 10 s)%s, to %s", ring_n,
-           thumbs_on ? "thumbnails 320x180" : "no thumbnails", (unsigned long long)(spike_ns / 1000000),
+           thumbs_on ? "thumbnails 640x360" : "no thumbnails", (unsigned long long)(spike_ns / 1000000),
            spike_ns ? "" : " (spike trigger off)", base_dir);
     if (thumbs_on)
         rt_log("flight: memory: records %llu KB, thumbnail ring %llu MB (host-visible)",
@@ -156,7 +156,8 @@ static void copy_events(DumpJob *j, uint64_t first) {
     }
 }
 
-static const char *const tex_kind_names[FLIGHT_TEX_N] = {"new", "up", "reup", "release", "takeback", "drop"};
+static const char *const tex_kind_names[FLIGHT_TEX_N] = {"new", "up", "reup", "release", "takeback", "drop", "bytes",
+                                                         "reg", "blank", "toblank", "blanksub", "direct", "unreg"};
 
 // <dir>/events.tsv: one line per texture event of the dump's frames (flight_tex).
 static void write_events(const DumpJob *j) {
@@ -180,11 +181,32 @@ static void write_events(const DumpJob *j) {
         static const char *const flag_names[] = {"depth", "stencil", "mirrored", "bound", "astc", "gpu"};
         for (int b = 0; b < 6; b++)
             if (e->flags & 1u << b) k += snprintf(fl + k, sizeof fl - (size_t)k, "%s%s", k ? "," : "", flag_names[b]);
-        char detail[160];
+        char detail[400];
         if (e->kind == FLIGHT_TEX_NEW) snprintf(detail, sizeof detail, "%s", vk_texture_start_name((int)e->detail));
         else if (e->kind == FLIGHT_TEX_DROP) snprintf(detail, sizeof detail, "%s", vk_texture_drop_name((int)e->detail));
         else if (e->kind == FLIGHT_TEX_UP || e->kind == FLIGHT_TEX_REUP)
             snprintf(detail, sizeof detail, "%u WriteTexels", e->detail);
+        else if (e->kind == FLIGHT_TEX_BYTES)
+            snprintf(detail, sizeof detail, "probe hash %08x, %u of 64 probes all zero", e->detail, e->us);
+        else if (e->kind == FLIGHT_TEX_REG) {
+            static const char *const was[4] = {"an unused slot", "the slot named another descriptor at this storage",
+                                               "the slot named other storage", "the slot named a finalized texture"};
+            snprintf(detail, sizeof detail, "slot %u: %s", e->us, was[e->detail & 3]);
+        } else if (e->kind == FLIGHT_TEX_UNREG) {
+            snprintf(detail, sizeof detail, "slot %u sampled, not registered now", e->us);
+        } else if (e->kind == FLIGHT_TEX_TOBLANK || e->kind == FLIGHT_TEX_BLANKSUB || e->kind == FLIGHT_TEX_DIRECT) {
+            static const char *const bit[] = {"finalized", "own entry", "released", "superseded", "overwritten", "uploaded",
+                                              "storage readable", "held out", "CPU-written", "GPU-owned", "retiring",
+                                              "resolves to an entry", "that entry is a volume", "that entry is another descriptor's",
+                                              "no shader reads the pool as a volume"};
+            int o = snprintf(detail, sizeof detail, e->kind == FLIGHT_TEX_TOBLANK ? "slot %u lost its picture:"
+                             : e->kind == FLIGHT_TEX_DIRECT ? "slot %u bound by a draw got its stand-in:"
+                             : "slot %u had no picture when its submission ended:", e->us);
+            for (int b = 0; b < 15 && o < (int)sizeof detail - 40; b++)
+                if (e->detail & 1u << b) o += snprintf(detail + o, sizeof detail - (size_t)o, " %s;", bit[b]);
+        } else if (e->kind == FLIGHT_TEX_BLANK)
+            snprintf(detail, sizeof detail, "slot %u sampled as its stand-in%s%s", e->us, e->detail & 1 ? ", finalized" : "",
+                     e->detail & 2 ? ", held out" : "");
         else detail[0] = 0;
         fprintf(f, "%llu\t%s\t%#llx\t%#x\t%u\t%u\t%u\t%s\t%s\t%u\n", (unsigned long long)e->frame,
                 e->kind < FLIGHT_TEX_N ? tex_kind_names[e->kind] : "?", (unsigned long long)e->addr, e->format, e->w,

@@ -178,15 +178,18 @@ int probe(void) {
     return 1;
 }
 
-// One context per output size, made for render sizes up to the output's, as vk_ffx.cpp keeps them for FSR 3.1: every
-// render scale of the menu runs on it with its own render size at each dispatch, which the API allows up to the
-// context's maxRenderSize. With one context per render and output size, each mode tried made a context of its own,
-// about 217 MiB of video memory and 50 to 70 ms each, up to six were kept beside FSR 3.1's, and three creations that
-// failed (the card out of memory) turned FSR 4 off for the run. The descriptors a context was made from stay with it,
-// as the API asks ("must remain live until ffxDestroyContext").
+// One context per render size and output size, kept as vk_ffx.cpp keeps FSR 3.1's (see there): a new render size
+// makes a context of its own (50 to 70 ms and up to about 217 MiB of video memory) and the one before goes a few frames
+// later, so a mode change costs a creation; with the game's dynamic resolution on one context with
+// FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION takes every step. Contexts kept for every mode tried, as once, piled up to six
+// beside FSR 3.1's and three creations that failed (the card out of memory) turned FSR 4 off for the run; one context
+// for every render size, as next, preceded an access violation in AMD's driver inside the dispatch after a switch from
+// 67 % to 100 %. The descriptors a context was made from stay with it, as the API asks ("must remain live until
+// ffxDestroyContext").
 struct Up {
     ffxContext ctx = nullptr;
-    uint32_t mw = 0, mh = 0, ow = 0, oh = 0;   // the largest render size it takes; the output size
+    uint32_t mw = 0, mh = 0, ow = 0, oh = 0;   // the render size it was made for (the largest it takes with drs); the output size
+    bool drs = false;                          // made for dynamic resolution (FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION)
     uint64_t used = 0, used_ns = 0;            // up_tick and the time when context_for last returned it
     ffxCreateContextDescUpscale desc = {};
     ffxCreateBackendVKDesc backend = {};
@@ -218,7 +221,7 @@ FfxApiResource image(const VkFfxImage *i, uint32_t state, uint32_t usage) {
 }
 
 // A context in slot for render sizes up to mw x mh and the output size ow x oh; NULL when it is not made.
-Up *create(Up *slot, uint32_t mw, uint32_t mh, uint32_t ow, uint32_t oh) {
+Up *create(Up *slot, uint32_t mw, uint32_t mh, uint32_t ow, uint32_t oh, bool drs) {
     const VkCtx *c = vk_ctx();
     *slot = Up();
     slot->built.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
@@ -233,6 +236,9 @@ Up *create(Up *slot, uint32_t mw, uint32_t mh, uint32_t ow, uint32_t oh) {
     slot->desc.header.pNext = &slot->backend.header;
     slot->desc.flags =
         FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;   // a finite far plane, as FSR 3.1's
+    // NX2NAVI_FFX_DEBUG=1 (test): the library checks the values of each dispatch and says what it finds (message)
+    if (rt_knob("FFX_DEBUG", "0")) slot->desc.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
+    if (drs) slot->desc.flags |= FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
     slot->desc.maxRenderSize = {mw, mh};
     slot->desc.maxUpscaleSize = {ow, oh};
     slot->desc.fpMessage = message;
@@ -244,7 +250,7 @@ Up *create(Up *slot, uint32_t mw, uint32_t mh, uint32_t ow, uint32_t oh) {
         *slot = Up();
         return nullptr;
     }
-    slot->mw = mw, slot->mh = mh, slot->ow = ow, slot->oh = oh;
+    slot->mw = mw, slot->mh = mh, slot->ow = ow, slot->oh = oh, slot->drs = drs;
     ffxQueryGetProviderVersion v = {};
     v.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     A.query(&slot->ctx, &v.header);
@@ -266,22 +272,29 @@ Up *create(Up *slot, uint32_t mw, uint32_t mh, uint32_t ow, uint32_t oh) {
     return slot;
 }
 
-// The context for a render size and an output size: the one of that output size that takes the render size, else a
-// new one, in a free slot or in place of the least recently used one, with the device idle first. A creation that
-// fails is tried once more after every context not in use has gone, FSR 3.1's idle ones too (vk_ffx_trim_idle): what
-// it lacked was most often video memory.
+// The context for a render size and an output size: the one made for them, else a new one, in a free slot or in place
+// of the least recently used one, with the device idle first; the others of that output size go once no command
+// buffer can hold them. A creation that fails is tried once more after every context not in use has gone, FSR 3.1's
+// idle ones too (vk_ffx_trim_idle): what it lacked was most often video memory.
 Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     up_tick++;
     uint64_t now = plat_now_ns();
-    Up *small = nullptr;   // a context of this output size made for smaller render sizes
+    const bool drs = cfg_bool("NX2NAVI_DYN_RES");
+    Up *found = nullptr;
     for (Up &u : U)
-        if (u.ctx && u.ow == ow && u.oh == oh) {
-            if (w <= u.mw && h <= u.mh) {
-                u.used = up_tick, u.used_ns = now;
-                return &u;
-            }
-            small = &u;
+        if (u.ctx && u.ow == ow && u.oh == oh && u.drs == drs && (drs ? w <= u.mw && h <= u.mh : w == u.mw && h == u.mh))
+            found = &u;
+    const VkCtx *c = vk_ctx();
+    int waited = 0;
+    for (Up &u : U)   // the contexts of this output size for another render size, once no command buffer holds them
+        if (u.ctx && &u != found && u.ow == ow && u.oh == oh && up_tick - u.used >= UP_RECENT) {
+            if (!waited++) vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // their work may be in flight
+            destroy_up(&u, "the render size changed");
         }
+    if (found) {
+        found->used = up_tick, found->used_ns = now;
+        return found;
+    }
     Up *slot = nullptr, *lru = nullptr;
     for (Up &u : U) {
         if (!u.ctx) {
@@ -290,24 +303,22 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
         }
         if (up_tick - u.used >= UP_RECENT && (!lru || u.used < lru->used)) lru = &u;
     }
-    if (small && up_tick - small->used >= UP_RECENT) slot = nullptr, lru = small;   // a larger one takes its place
-    const VkCtx *c = vk_ctx();
     if (!slot && lru) {
         vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // its work may still be in flight
-        destroy_up(lru, lru == small ? "a larger render size came" : "its slot went to another output size");
+        destroy_up(lru, "its slot went to another output size");
         slot = lru;
     }
     if (!slot) return nullptr;
-    // the render size up to the output size: every mode of the menu, and a scene drawn at the output size itself
-    uint32_t mw = w > ow ? w : ow, mh = h > oh ? h : oh;
-    Up *u = create(slot, mw, mh, ow, oh);
+    // the render size itself; for dynamic resolution, every size up to the output's (and a scene at the output size)
+    uint32_t mw = !drs ? w : w > ow ? w : ow, mh = !drs ? h : h > oh ? h : oh;
+    Up *u = create(slot, mw, mh, ow, oh, drs);
     if (!u) {
         int freed = 0;
         vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
         for (Up &o : U)
             if (o.ctx && up_tick - o.used >= UP_RECENT) destroy_up(&o, "room for a context whose creation failed"), freed++;
         freed += vk_ffx_trim_idle(UP_RECENT);
-        if (freed) u = create(slot, mw, mh, ow, oh);
+        if (freed) u = create(slot, mw, mh, ow, oh, drs);
     }
     if (u) u->used = up_tick, u->used_ns = now;
     return u;

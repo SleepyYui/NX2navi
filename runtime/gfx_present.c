@@ -140,6 +140,41 @@ static VkImageView g_sc_view[MAX_IMAGES];   // colour attachment views for the m
 static VkSemaphore g_render_done[MAX_IMAGES];
 static VkCommandPool g_pool;
 static VkCommandBuffer g_cb[FRAMES];
+
+// The GPU timeline (NX2NAVI_TRACE=perf, vk.h vk_gtl_note): a timestamp pair per present slot around the present's command
+// buffer, read once the slot's fence is waited for again. Its gap before it shows a wait for the acquired image (the
+// submission waits on the acquire semaphore) as idle time with work queued before presents.
+static VkQueryPool pts_pool;
+static int pts_state;                       // 0 not set up, 1 on, -1 off
+static uint8_t pts_on[FRAMES];              // the slot's pair was written by its last present
+static uint64_t pts_sub[FRAMES];            // when that present went to the queue
+
+static void pts_begin(VkCtx *c, VkCommandBuffer cb, unsigned slot) {
+    pts_on[slot] = 0;
+    if (!(rt_trace & RT_TRACE_PERF) || pts_state < 0) return;
+    if (!pts_state) {
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                    .queryCount = 2 * FRAMES};
+        pts_state = c->props.limits.timestampComputeAndGraphics &&
+                    vkCreateQueryPool(c->device, &qi, NULL, &pts_pool) == VK_SUCCESS ? 1 : -1;
+        if (pts_state < 0) return;
+    }
+    vkCmdResetQueryPool(cb, pts_pool, 2 * slot, 2);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pts_pool, 2 * slot);
+    pts_on[slot] = 1;
+}
+
+static void pts_end(VkCommandBuffer cb, unsigned slot) {
+    if (pts_on[slot]) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pts_pool, 2 * slot + 1);
+}
+
+static void pts_read(VkCtx *c, unsigned slot) {   // the slot's fence was waited for: its last present is done
+    if (!pts_on[slot]) return;
+    pts_on[slot] = 0;
+    uint64_t t[2];
+    if (vkGetQueryPoolResults(c->device, pts_pool, 2 * slot, 2, sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+        vk_gtl_note(GTL_PRESENT, pts_sub[slot], t[0], t[1]);
+}
 static VkFence g_fence[FRAMES];
 static VkSemaphore g_acquire[FRAMES];
 static unsigned g_frame;
@@ -907,8 +942,18 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
     VkImageView pv;
     uint32_t pw, ph;
     VkFormat pf;
-    if (!(vk_fg_active() || ng_running()) || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) || (int)pw != w || (int)ph != h)
+    if (!(vk_fg_active() || ng_running()) || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) || !pw || !ph || w <= 0 || h <= 0)
         return VK_NULL_HANDLE;
+    // The upscaler's output can be smaller than the presented picture: the scene is 75% of it in handheld mode
+    // (widescreen.c, 1440x810 in a 1920x1080 picture) and the game's last passes scale it up with the HUD. Taken only
+    // at the same size, as before, that frame had no HUD-less picture and was not generated: 5 of 3600 frames generated
+    // in handheld mode on an RX 580 (2026-11-11). The crop is taken at the same place of the smaller picture.
+    int prect[4] = {rect[0], rect[1], rect[2], rect[3]};
+    if ((int)pw != w || (int)ph != h) {
+        prect[0] = (int)((int64_t)rect[0] * pw / w), prect[1] = (int)((int64_t)rect[1] * ph / h);
+        prect[2] = (int)((int64_t)rect[2] * pw / w), prect[3] = (int)((int64_t)rect[3] * ph / h);
+        if (prect[2] <= 0 || prect[3] <= 0) return VK_NULL_HANDLE;
+    }
     VkCtx *c = vk_ctx();
     if (g_hl && (g_hl_w != g_sc_ext.width || g_hl_h != g_sc_ext.height || g_hl_fmt != g_sc_fmt)) {
         vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
@@ -945,7 +990,7 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
     }
     // the steps' per-slot views of their source: a slot of its own (the presented picture's views stay valid for this
     // command buffer); with HDR the PQ encode as for the presented float picture
-    put_picture(cb, slot + FRAMES, pic, pf, w, h, rect, g_hl, to, general);
+    put_picture(cb, slot + FRAMES, pic, pf, (int)pw, (int)ph, prect, g_hl, to, general);
     sync_barrier(cb, g_hl, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
@@ -1373,6 +1418,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         rt_log("gfx: present fence wait timed out");
         goto out;
     }
+    pts_read(c, slot);   // the GPU timeline (vk_gtl_note): this slot's last present is done
     uint32_t idx = 0;
     // NGX frame generation: the frame is composed into ng.bb and the presenter shows it (ng_show); no acquire here
     const int ngp = ng_ready();
@@ -1457,6 +1503,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(cb, &bi);
+    pts_begin(c, cb, slot);
     uint64_t crumb = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     vk_crumb(cb, VK_CRUMB_PRESENT, crumb);
     VkImage dst = ngp ? ng.bb.img : g_sc_img[idx];
@@ -1549,6 +1596,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     const int via_ng = ng_count >= 0;
     if (!via_ng) sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
     vk_crumb(cb, VK_CRUMB_PRESENT_END, crumb);
+    pts_end(cb, slot);
     vkEndCommandBuffer(cb);
 
     VkSemaphoreSubmitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_acquire[slot],
@@ -1572,8 +1620,10 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         if (ng_n > 2) ng_wait_signaled(ng_n - 2);
     }
     vk_queue_lock();
+    pts_sub[slot] = plat_now_ns();
     r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_fence[slot]);
     vk_queue_unlock();
+    if (r != VK_SUCCESS) pts_on[slot] = 0;
     if (r == VK_SUCCESS && via_ng) {   // the presenter shows the generated frames, then this one
         ng.n = ng_n;
         ng_hand(idx, ng_count, ng_set, ng_n);
