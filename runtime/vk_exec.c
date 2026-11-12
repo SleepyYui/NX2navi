@@ -899,16 +899,21 @@ void vk_exec_pass_end(VkExec *ex) {
             bc_copy_back(ex, &ex->color[i]);
     if (vk_dump_armed) vk_dump_pass_end(ex);
     uint64_t stamp = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
+    // Mark targets before taking the history lock. An inline texture operation can end a pass while already holding
+    // the texture lock; taking these locks in the opposite order on another replay worker deadlocks both workers.
+    for (int i = 0; i < 8; i++)
+        if (ex->color[i].image) vk_texture_gpu_written(ex->color[i].tex);
+    if (ex->depth.image) vk_texture_gpu_written(ex->depth.tex);
     int lk = vk_exec_shared();
     if (lk) plat_mutex_lock(&tfr_lock);
     for (int i = 0; i < 8; i++)
         if (ex->color[i].image) {
             TfrTarget ft = tfr_of(&ex->color[i]);
-            vk_texture_gpu_written(ex->color[i].tex), tfr_note(&ft, stamp);
+            tfr_note(&ft, stamp);
         }
     if (ex->depth.image) {
         TfrTarget ft = tfr_of(&ex->depth);
-        vk_texture_gpu_written(ex->depth.tex), tfr_note(&ft, stamp);
+        tfr_note(&ft, stamp);
     }
     if (lk) plat_mutex_unlock(&tfr_lock);
 }
