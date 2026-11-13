@@ -25,6 +25,7 @@ import argparse
 import os
 import platform
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -214,7 +215,9 @@ def build(work, emitted, jobs, cflags):
     if any(p.wait() for p in procs):
         raise SystemExit('compile failed')
     exe = work / ('func.exe' if os.name == 'nt' else 'func')
-    subprocess.check_call([cc, '-fuse-ld=lld', '-o', str(exe)] + [str(o) for o in objs], env=env)
+    cc_dir = Path(shutil.which(cc, path=env.get('PATH')) or cc).parent
+    lld = ['-fuse-ld=lld'] if any((cc_dir / name).is_file() for name in ('ld.lld', 'ld.lld.exe')) else []
+    subprocess.check_call([cc, *lld, '-o', str(exe)] + [str(o) for o in objs], env=env)
     return exe
 
 
